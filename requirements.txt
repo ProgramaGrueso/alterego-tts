@@ -1,0 +1,35 @@
+# Core Deep Learning (CUDA 12.4)
+torch>=2.4.0
+torchvision>=0.19.0
+torchaudio>=2.4.0
+
+# ONNX Runtime & Inference Acceleration
+onnx>=1.16.0
+onnxruntime-gpu>=1.18.0
+
+# Vision, Media & Webcam
+opencv-python>=4.10.0
+pillow>=10.0.0
+imageio>=2.34.0
+imageio-ffmpeg>=0.5.0
+pyvirtualcam>=0.11.0
+
+# Face Analysis & Animation
+insightface>=0.7.3
+pykalman>=0.9.7
+
+# Audio & Tracking
+sounddevice>=0.5.0
+soundfile>=0.12.0
+librosa>=0.10.0
+
+# Model Hub & CLI
+huggingface-hub[cli]>=0.23.0
+
+# Numerics & Utilities
+numpy
+scipy
+pyyaml
+tqdm
+tyro
+rich

@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# LivePortrait Pretrained Weights & Cache (Heavy binary models > 100MB)
+# Download them with ./download_weights.sh
+liveportrait_src/pretrained_weights/*
+!liveportrait_src/pretrained_weights/.gitkeep
+liveportrait_src/pretrained_weights/.cache/
+
+# Test and temporary captures
+webcam_test*.jpg
+webcam_test.jpg
+*.tmp
+
+# Operating System & IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
