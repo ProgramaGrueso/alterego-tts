@@ -14,6 +14,8 @@ if "QT_QPA_PLATFORM" not in os.environ:
 import time
 import signal
 import argparse
+import threading
+import queue
 import numpy as np
 import cv2
 import torch
@@ -29,8 +31,8 @@ from src.config.crop_config import CropConfig
 from src.live_portrait_wrapper import LivePortraitWrapper
 from src.utils.cropper import Cropper
 from src.utils.camera import get_rotation_matrix
-from src.utils.crop import paste_back, prepare_paste_back, crop_image
-from src.utils.retargeting_utils import calc_eye_close_ratio
+from src.utils.crop import paste_back, prepare_paste_back, crop_image, _transform_img
+from src.utils.retargeting_utils import calc_eye_close_ratio, calc_lip_close_ratio
 
 
 class OneEuroFilter:
@@ -77,18 +79,29 @@ class OneEuroFilter:
 
 
 class LivePortraitCamPipeline:
-    def __init__(self, source_image_path: str, device_id: int = 0, flag_pasteback: bool = False, flag_compile: bool = False, driving_multiplier: float = 0.65):
+    def __init__(self, source_image_path: str, device_id: int = 0, flag_pasteback: bool = False, flag_compile: bool = False, driving_multiplier: float = 0.50, skin_noise: float = 2.5, flag_fp32_generator: bool = False, flag_lip_retargeting: bool = True, lip_multiplier: float = 1.00):
         self.device_id = device_id
         self.flag_pasteback = flag_pasteback
         self.driving_multiplier = driving_multiplier
+        self.skin_noise = float(skin_noise)
+        self.flag_fp32_generator = flag_fp32_generator
+        self.flag_lip_retargeting = flag_lip_retargeting
+        self.lip_multiplier = float(lip_multiplier)
+
+        # Facial keypoint indices in LivePortrait latent expression space
+        self.LIP_INDICES = [6, 12, 14, 17, 19, 20]
+        self.FACE_INDICES = [i for i in range(21) if i not in self.LIP_INDICES]
 
         # Anti-jitter One-Euro filters tailored for each facial/pose component
         self.smoother_lmk = OneEuroFilter(min_cutoff=0.8, beta=0.02)
-        self.smoother_angles = OneEuroFilter(min_cutoff=0.4, beta=0.02)
-        self.smoother_exp = OneEuroFilter(min_cutoff=0.7, beta=0.06)
-        self.smoother_t = OneEuroFilter(min_cutoff=0.4, beta=0.01)
-        self.smoother_scale = OneEuroFilter(min_cutoff=0.3, beta=0.01)
+        self.smoother_angles = OneEuroFilter(min_cutoff=0.3, beta=0.02)
+        # Separate filters: smooth for facial resting expressions, fast/reactive for lip speech articulation
+        self.smoother_exp_face = OneEuroFilter(min_cutoff=0.4, beta=0.025)
+        self.smoother_exp_lip = OneEuroFilter(min_cutoff=1.0, beta=0.18)
+        self.smoother_t = OneEuroFilter(min_cutoff=0.45, beta=0.025)
+        self.smoother_scale = OneEuroFilter(min_cutoff=0.45, beta=0.02)
         self.smoother_eye = OneEuroFilter(min_cutoff=2.5, beta=0.10)
+        self.smoother_lip_seal = OneEuroFilter(min_cutoff=1.0, beta=0.05)
 
         # Check CUDA availability
         if not torch.cuda.is_available():
@@ -104,7 +117,7 @@ class LivePortraitCamPipeline:
         self.inf_cfg.flag_relative_motion = True
         self.inf_cfg.flag_stitching = True
         self.inf_cfg.flag_eye_retargeting = True
-        self.inf_cfg.flag_lip_retargeting = False
+        self.inf_cfg.flag_lip_retargeting = self.flag_lip_retargeting
         self.inf_cfg.flag_do_torch_compile = flag_compile
 
         self.crop_cfg = CropConfig()
@@ -118,13 +131,22 @@ class LivePortraitCamPipeline:
 
         # Convert core generators to half precision for Ada Lovelace tensor cores
         self.wrapper.warping_module.half()
-        self.wrapper.spade_generator.half()
+        if not self.flag_fp32_generator:
+            self.wrapper.spade_generator.half()
+        else:
+            print("[*] Diagnostic: spade_generator retained in FP32 precision.")
         self.wrapper.motion_extractor.half()
         if self.wrapper.stitching_retargeting_module:
             for k in self.wrapper.stitching_retargeting_module:
                 self.wrapper.stitching_retargeting_module[k].half()
 
         # 3. Pre-process static source avatar (One-Time Execution)
+        if not os.path.isabs(source_image_path):
+            if os.path.exists(source_image_path):
+                source_image_path = os.path.abspath(source_image_path)
+            elif os.path.exists(os.path.join(CURRENT_DIR, source_image_path)):
+                source_image_path = os.path.join(CURRENT_DIR, source_image_path)
+
         print(f"[*] Pre-processing source avatar from: {source_image_path}...")
         if not os.path.exists(source_image_path):
             raise FileNotFoundError(f"Source avatar image not found at: {source_image_path}")
@@ -157,14 +179,27 @@ class LivePortraitCamPipeline:
         self.c_s_eye_mean = float(self.c_s_eyes.mean())
         self.c_d_eye_0 = None
 
-        # Precompute pasteback mask if requested
+        # Precompute source lip ratio for lip retargeting
+        self.c_s_lip = calc_lip_close_ratio(self.source_lmk[None])
+        self.c_s_lip_tensor = torch.from_numpy(self.c_s_lip).half().to(f"cuda:{device_id}")
+
+        # Precompute pasteback mask and seamlessClone ROI if requested
         if self.flag_pasteback:
             h, w = self.source_rgb.shape[:2]
             self.mask_ori_float = prepare_paste_back(
                 self.inf_cfg.mask_crop, self.M_c2o, dsize=(w, h)
             )
+            self.mask_u8 = (self.mask_ori_float[..., 0] * 255).astype(np.uint8)
+            bx, by, bw, bh = cv2.boundingRect(self.mask_u8)
+            self.paste_bbox = (bx, by, bw, bh)
+            self.paste_center = (bx + bw // 2, by + bh // 2)
+            self.mask_roi = self.mask_u8[by:by+bh, bx:bx+bw]
         else:
             self.mask_ori_float = None
+            self.mask_u8 = None
+            self.paste_bbox = None
+            self.paste_center = None
+            self.mask_roi = None
 
         print("[+] Source avatar features pre-computed and cached in VRAM.")
 
@@ -175,17 +210,21 @@ class LivePortraitCamPipeline:
         self.is_tracking = False
 
     def calibrate_neutral_pose(self, x_d_info, lmk):
-        """Calibrates neutral expression, eye openness, and head pose from driving webcam."""
+        """Calibrates neutral expression, eye openness, lip baseline, and head pose from driving webcam."""
         self.x_d_0_info = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in x_d_info.items()}
         r_eyes = calc_eye_close_ratio(lmk[None])
         self.c_d_eye_0 = max(float(r_eyes.mean()), 0.15)
+        r_lip = calc_lip_close_ratio(lmk[None])
+        self.c_d_lip_0 = max(float(r_lip[0, 0]), 0.02)
         self.smoother_lmk.reset()
         self.smoother_angles.reset()
-        self.smoother_exp.reset()
+        self.smoother_exp_face.reset()
+        self.smoother_exp_lip.reset()
         self.smoother_t.reset()
         self.smoother_scale.reset()
         self.smoother_eye.reset()
-        print(f"[+] Pose neutra calibrada (Sensibilidad: {self.driving_multiplier:.2f} | Apertura ojos: {self.c_d_eye_0:.2f}).")
+        self.smoother_lip_seal.reset()
+        print(f"[+] Pose neutra calibrada (Sensibilidad cabeza: {self.driving_multiplier:.2f} | Labios: {self.lip_multiplier:.2f} | Ojos: {self.c_d_eye_0:.2f} | Boca reposo: {self.c_d_lip_0:.2f}).")
 
     def process_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
         """
@@ -262,8 +301,8 @@ class LivePortraitCamPipeline:
             delta_roll = x_d_i_info["roll"] - self.x_d_0_info["roll"]
             angles_raw = torch.cat([delta_pitch, delta_yaw, delta_roll], dim=-1)
 
-            # Deadband filter: micro-movements < 0.4 degrees are suppressed (kills sensor tremor)
-            deadband_angle = 0.4
+            # Deadband filter: micro-movements < 0.30 degrees are suppressed (preserves calm posture when still)
+            deadband_angle = 0.30
             angles_raw = torch.where(torch.abs(angles_raw) < deadband_angle, angles_raw * 0.25, angles_raw)
             angles_smooth = self.smoother_angles.update(angles_raw)
 
@@ -274,12 +313,31 @@ class LivePortraitCamPipeline:
             roll_new = self.x_s_info["roll"] + angles_damped[:, 2:3]
             R_new = get_rotation_matrix(pitch_new, yaw_new, roll_new).half()
 
-            # 5. Expression delta (smoothed and damped to avoid mouth/eye twitching)
+            # 5. Expression delta (Capa 1: Lipsync reactivo desacoplado para labios + estabilidad facial)
             delta_raw = x_d_i_info["exp"] - self.x_d_0_info["exp"]
-            # Deadband on tiny resting expression jitter
-            delta_raw = torch.where(torch.abs(delta_raw) < 0.005, delta_raw * 0.3, delta_raw)
-            delta_smooth = self.smoother_exp.update(delta_raw)
-            delta_new = self.x_s_info["exp"] + delta_smooth * self.driving_multiplier
+
+            # Región facial (cejas, pómulos): deadband suave anti-jitter y filtro One-Euro suave
+            delta_face = delta_raw.clone()
+            deadband_face = 0.0045
+            delta_face = torch.where(torch.abs(delta_face) < deadband_face, delta_face * 0.25, delta_face)
+            delta_face_smooth = self.smoother_exp_face.update(delta_face)
+
+            # Región labial (articulación vocal / fonemas): deadband anti-muecas en reposo + One-Euro adaptativo
+            delta_lip_raw = delta_raw.clone()
+            deadband_lip = 0.0055
+            delta_lip_raw = torch.where(torch.abs(delta_lip_raw) < deadband_lip, delta_lip_raw * 0.20, delta_lip_raw)
+            delta_lip_smooth = self.smoother_exp_lip.update(delta_lip_raw)
+
+            # Fusión de componentes:
+            # - Resto del rostro escala con driving_multiplier (control natural de expresiones secundarias)
+            # - Labios escalan con lip_multiplier (articulación nítida e independiente de la cabeza)
+            delta_combined = delta_face_smooth.clone()
+            for idx in self.FACE_INDICES:
+                delta_combined[:, idx, :] = delta_face_smooth[:, idx, :] * self.driving_multiplier
+            for idx in self.LIP_INDICES:
+                delta_combined[:, idx, :] = delta_lip_smooth[:, idx, :] * self.lip_multiplier
+
+            delta_new = self.x_s_info["exp"] + delta_combined
 
             # 6. Translation and scale (smoothed and controlled)
             t_raw = x_d_i_info["t"] - self.x_d_0_info["t"]
@@ -317,19 +375,46 @@ class LivePortraitCamPipeline:
                 # Fully open: delta_eye is zero. Eyes remain 100% natural, never bulging!
                 self.smoother_eye.reset()
 
+            # Capa 2: Lip Retargeting Asistido (Asistencia inteligente de sellado sin sobre-apertura)
+            # Solo interviene para cerrar suavemente si la boca está en reposo; al hablar no suma apertura extra
+            if self.inf_cfg.flag_lip_retargeting and self.c_d_lip_0 is not None:
+                r_lip_raw = float(calc_lip_close_ratio(lmk[None])[0, 0])
+                r_lip_cur = float(self.smoother_lip_seal.update(np.array([r_lip_raw]))[0])
+                if r_lip_cur < self.c_d_lip_0 * 1.15:
+                    c_d_lip_tensor = torch.tensor([[r_lip_cur]], dtype=torch.float16, device=f"cuda:{self.device_id}")
+                    combined_lip = torch.cat([self.c_s_lip_tensor, c_d_lip_tensor], dim=1)
+                    delta_lip = self.wrapper.retarget_lip(self.x_s.half(), combined_lip)
+                    seal_factor = max(0.0, 1.0 - (r_lip_cur / (self.c_d_lip_0 * 1.15)))
+                    x_d_i_new = x_d_i_new + delta_lip * (0.08 * seal_factor)
+
             # 8. Stitching
             if self.inf_cfg.flag_stitching:
                 x_d_i_new = self.wrapper.stitching(self.x_s, x_d_i_new).half()
 
-            # 9. Warping and SPADE Generator Decoding (FP16 on Ada Lovelace)
+            # 9. Warping and SPADE Generator Decoding
             out = self.wrapper.warp_decode(self.f_s, self.x_s, x_d_i_new)
             out_crop = self.wrapper.parse_output(out["out"])[0]  # HxWx3 uint8 RGB
 
+            # Skin texture grain to reduce plastic / over-smoothed appearance
+            if self.skin_noise > 0.0:
+                noise = np.random.normal(0, self.skin_noise, out_crop.shape).astype(np.int16)
+                out_crop = np.clip(out_crop.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
         self.is_tracking = True
 
-        # 7. Formatting and Pasteback
+        # 10. Formatting and Pasteback (with seamlessClone & fallback)
         if self.flag_pasteback and self.mask_ori_float is not None:
-            out_full = paste_back(out_crop, self.M_c2o, self.source_rgb, self.mask_ori_float)
+            try:
+                dsize = (self.source_rgb.shape[1], self.source_rgb.shape[0])
+                transformed_crop = _transform_img(out_crop, self.M_c2o, dsize=dsize)
+                bx, by, bw, bh = self.paste_bbox
+                if bw > 0 and bh > 0:
+                    src_roi = transformed_crop[by:by+bh, bx:bx+bw]
+                    out_full = cv2.seamlessClone(src_roi, self.source_rgb, self.mask_roi, self.paste_center, cv2.NORMAL_CLONE)
+                else:
+                    out_full = paste_back(out_crop, self.M_c2o, self.source_rgb, self.mask_ori_float)
+            except Exception:
+                out_full = paste_back(out_crop, self.M_c2o, self.source_rgb, self.mask_ori_float)
             return cv2.cvtColor(out_full, cv2.COLOR_RGB2BGR)
         else:
             return cv2.cvtColor(out_crop, cv2.COLOR_RGB2BGR)
@@ -364,58 +449,40 @@ def format_frame_for_output(frame: np.ndarray, target_w: int = 640, target_h: in
         scale = min(target_w / w, target_h / h)
         rw, rh = int(w * scale), int(h * scale)
         resized = cv2.resize(frame, (rw, rh), interpolation=cv2.INTER_AREA)
-        bg = cv2.resize(frame, (target_w, target_h))
-        bg = cv2.GaussianBlur(bg, (51, 51), 0)
+        # Blur a baja resolución (mucho más barato) y luego escalar de vuelta;
+        # visualmente casi idéntico a difuminar el frame completo a 640x480.
+        small = cv2.resize(frame, (target_w // 4, target_h // 4), interpolation=cv2.INTER_AREA)
+        small = cv2.GaussianBlur(small, (9, 9), 0)
+        bg = cv2.resize(small, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
         x_off = (target_w - rw) // 2
         y_off = (target_h - rh) // 2
         bg[y_off:y_off + rh, x_off:x_off + rw] = resized
         return bg
 
 
-def draw_preview_hud(avatar_bgr: np.ndarray, cam_bgr: np.ndarray, is_tracking: bool, is_calibrated: bool, brightness: float, driving_mult: float = 0.65) -> np.ndarray:
+class StdinCommandListener:
     """
-    Renders status HUD and PiP webcam thumbnail for the local preview window only.
-    The virtual camera receives the clean video without overlays.
+    Escucha stdin en un hilo aparte para poder recalibrar la pose neutral
+    (o ajustar sensibilidad) escribiendo un comando + Enter en la misma
+    terminal, sin necesidad de una ventana de preview.
     """
-    canvas = avatar_bgr.copy()
-    h, w = canvas.shape[:2]
+    def __init__(self):
+        self.q = queue.Queue()
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
 
-    # 1. PiP webcam inset in top-right corner
-    pip_w, pip_h = 160, 120
-    pip_cam = cv2.resize(cam_bgr, (pip_w, pip_h))
-    margin = 15
-    x1, y1 = w - pip_w - margin, margin
-    x2, y2 = x1 + pip_w, y1 + pip_h
+    def _reader(self):
+        for line in sys.stdin:
+            cmd = line.strip().lower()
+            if cmd:
+                self.q.put(cmd)
 
-    border_col = (0, 220, 0) if is_tracking else (0, 0, 255)
-    canvas[y1:y2, x1:x2] = pip_cam
-    cv2.rectangle(canvas, (x1 - 2, y1 - 2), (x2 + 2, y2 + 2), border_col, 2)
-    cv2.putText(canvas, "TU WEBCAM", (x1 + 6, y1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(canvas, "TU WEBCAM", (x1 + 6, y1 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
-
-    # 2. Status badge top-left
-    if brightness < 15.0:
-        msg = "CAMARA OSCURA / TAPA CERRADA"
-        color = (0, 0, 240)
-    elif not is_tracking:
-        msg = "BUSCANDO TU ROSTRO..."
-        color = (0, 140, 255)
-    else:
-        calib_str = "CALIBRADO" if is_calibrated else "PRESIONA C"
-        msg = f"TRACKING OK ({calib_str})"
-        color = (0, 200, 0)
-
-    # Semi-transparent dark pill background for readability
-    overlay = canvas.copy()
-    cv2.rectangle(overlay, (margin, margin), (margin + 340, margin + 38), (15, 15, 15), -1)
-    cv2.addWeighted(overlay, 0.75, canvas, 0.25, 0, canvas)
-    cv2.rectangle(canvas, (margin, margin), (margin + 340, margin + 38), color, 1)
-    cv2.putText(canvas, msg, (margin + 12, margin + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-
-    # Hotkey hints at bottom
-    hud_hints = f"[C] Calibrar  |  [-/+] Sensibilidad: {driving_mult:.2f}  |  [Q] Salir"
-    cv2.putText(canvas, hud_hints, (margin, h - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.43, (220, 220, 220), 1, cv2.LINE_AA)
-    return canvas
+    def poll(self):
+        """Devuelve el próximo comando pendiente, o None si no hay ninguno."""
+        try:
+            return self.q.get_nowait()
+        except queue.Empty:
+            return None
 
 
 def find_default_virtual_cam():
@@ -425,8 +492,16 @@ def find_default_virtual_cam():
     return "/dev/video2"
 
 
+def find_default_source_image():
+    for candidate in ["avatar.png", "avatar2.png", "avatar.jpg"]:
+        candidate_path = os.path.join(CURRENT_DIR, candidate)
+        if os.path.exists(candidate_path):
+            return candidate_path
+    return os.path.join(CURRENT_DIR, "avatar.jpg")
+
+
 def parse_args():
-    default_img = "avatar2.png" if os.path.exists("avatar2.png") else "sample_avatar.jpg"
+    default_img = find_default_source_image()
     parser = argparse.ArgumentParser(description="LivePortrait Real-Time Animation Pipeline")
     parser.add_argument("--source-image", "-s", type=str, default=default_img,
                         help=f"Path to the static portrait photo to animate as avatar (default: {default_img}).")
@@ -438,17 +513,64 @@ def parse_args():
                         help="Target streaming frame rate (default: 30).")
     parser.add_argument("--pasteback", action="store_true",
                         help="Paste animated face back into full portrait frame.")
-    parser.add_argument("--preview", action="store_true",
-                        help="Show local OpenCV preview window.")
     parser.add_argument("--compile", action="store_true",
                         help="Enable torch.compile for maximum inference speed (>40-60 FPS).")
-    parser.add_argument("--driving-multiplier", "-m", type=float, default=0.65,
-                        help="Facial expression and motion intensity multiplier (default: 0.65). Values between 0.50-0.70 provide stable, subtle motion.")
+    parser.add_argument("--driving-multiplier", "-m", type=float, default=0.50,
+                        help="Head pose and general motion intensity multiplier (default: 0.50). Values between 0.40-0.60 provide stable, subtle motion.")
+    parser.add_argument("--lip-multiplier", type=float, default=1.00,
+                        help="Lip speech articulation multiplier (default: 1.00). Adjusts amplitude of mouth visemes/phonemes without head motion interference.")
+    parser.add_argument("--lip-retargeting", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable secondary landmark lip-seal assistance (default: True, use --no-lip-retargeting to disable).")
+    parser.add_argument("--no-preview", action="store_true",
+                        help="Disable interactive OpenCV preview window (preview is enabled by default).")
+    parser.add_argument("--skin-noise", type=float, default=2.5,
+                        help="Intensity of subtle Gaussian grain added post-decode to eliminate plastic look (default: 2.5, 0 = disabled).")
+    parser.add_argument("--fp32-generator", action="store_true",
+                        help="Keep spade_generator in FP32 precision to compare skin color banding against FP16.")
     parser.add_argument("--dry-run", type=float, default=0.0,
                         help="Run in benchmark mode for N seconds and exit with FPS statistics.")
     parser.add_argument("--no-virtualcam", action="store_true",
                         help="Disable virtual camera output (useful for testing without v4l2loopback).")
     return parser.parse_args()
+
+
+class ThreadedWebcam:
+    """
+    Lee la webcam en un hilo aparte y siempre expone el frame MÁS RECIENTE.
+    Evita que el loop de inferencia GPU tenga que esperar a cap.read() cada
+    vez, que es la causa más común de "stutter" en pipelines real-time.
+    """
+    def __init__(self, cap):
+        self.cap = cap
+        self.frame = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+        # Espera al primer frame real antes de continuar
+        for _ in range(50):
+            if self.frame is not None:
+                break
+            time.sleep(0.02)
+
+    def _reader(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                with self.lock:
+                    self.frame = frame
+
+    def read(self):
+        with self.lock:
+            return self.frame is not None, (self.frame.copy() if self.frame is not None else None)
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+    def release(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
+        self.cap.release()
 
 
 def check_camera_locks(device_path):
@@ -522,16 +644,23 @@ def main():
     print(f" Full Pasteback:   {args.pasteback}")
     print(f" Torch Compile:    {args.compile}")
     print(f" Motion Mult:      {args.driving_multiplier}")
+    print(f" Lip Mult:         {args.lip_multiplier}")
+    print(f" Lip Retargeting:  {args.lip_retargeting}")
+    print(f" Skin Grain Noise: {args.skin_noise}")
+    print(f" FP32 Generator:   {args.fp32_generator}")
     print("=" * 65)
 
-    # 1. Initialize Webcam
-    cap = open_webcam_robust(args.webcam_id, args.fps)
-    if cap is None:
+    # 1. Initialize Webcam (en hilo separado para no bloquear el loop de inferencia)
+    cap_raw = open_webcam_robust(args.webcam_id, args.fps)
+    if cap_raw is None:
         if args.dry_run > 0:
             print("[*] Generating synthetic webcam stream for benchmark dry-run...")
+            cap = cap_raw
         else:
             print(f"[!] No se pudo abrir la cámara física: {args.webcam_id}")
             sys.exit(1)
+    else:
+        cap = ThreadedWebcam(cap_raw)
 
     # 2. Initialize LivePortrait Pipeline
     pipeline = LivePortraitCamPipeline(
@@ -539,7 +668,11 @@ def main():
         device_id=0,
         flag_pasteback=args.pasteback,
         flag_compile=args.compile,
-        driving_multiplier=args.driving_multiplier
+        driving_multiplier=args.driving_multiplier,
+        skin_noise=args.skin_noise,
+        flag_fp32_generator=args.fp32_generator,
+        flag_lip_retargeting=args.lip_retargeting,
+        lip_multiplier=args.lip_multiplier
     )
 
     # Standard webcam output dimensions (640x480) for Zoom / WebRTC compatibility
@@ -562,19 +695,41 @@ def main():
             print(f"[!] Warning: Failed to open virtual camera ({args.output_device}): {e}")
             print("    Continuing with live processing and metrics...")
 
+    # 4. Initialize Preview Window (si está habilitada)
+    preview_enabled = not args.no_preview
+    window_name = "LivePortrait Preview [c: Centrar | q: Salir]"
+    if preview_enabled:
+        try:
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, out_w, out_h)
+            print(f"[+] Ventana de Preview activa: '{window_name}'")
+        except Exception as e:
+            print(f"[!] Warning: No se pudo abrir la ventana GUI ({e}). Continuando sin preview...")
+            preview_enabled = False
+
     # Signal handlers for clean termination
     running = True
     def signal_handler(sig, frame):
         nonlocal running
-        print("\n[*] Interruption caught (SIGINT). Exiting gracefully...")
+        print("\n[*] Interrupción capturada (SIGINT). Saliendo limpiamente...")
         running = False
     signal.signal(signal.SIGINT, signal_handler)
 
-    print("\n[>>>] Pipeline running. Press 'q' to quit, 'c' to recalibrate neutral pose.\n")
+    stdin_listener = StdinCommandListener()
+
+    print("\n" + "=" * 65)
+    print(" [>>>] PIPELINE EN EJECUCIÓN (CON VENTANA DE PREVIEW)")
+    print("=" * 65)
+    print(" Controles interactivos (en la ventana de preview o en la terminal):")
+    print("   c        -> Centrar / recalibrar pose neutral (mira de frente a la cámara)")
+    print("   q        -> Salir del preview y cerrar el programa")
+    print("   m+ / m-  -> Subir / bajar sensibilidad de cabeza (driving multiplier)")
+    print("   l+ / l-  -> Subir / bajar sensibilidad de articulación de labios\n")
 
     frame_count = 0
     t_start = time.perf_counter()
     latency_records = []
+    recalibration_feedback_time = 0.0
 
     try:
         while running:
@@ -592,7 +747,11 @@ def main():
             # Run inference
             t_infer_start = time.perf_counter()
             out_bgr = pipeline.process_frame(frame_bgr)
-            torch.cuda.synchronize()
+            # Solo sincronizamos cuando vamos a reportar métricas (cada 30 frames).
+            # Sincronizar SIEMPRE serializa CPU y GPU en cada iteración y es
+            # el principal responsable de que se sienta "trabado" en vez de fluido.
+            if (frame_count + 1) % 30 == 0:
+                torch.cuda.synchronize()
             t_infer_end = time.perf_counter()
 
             if out_bgr is None:
@@ -607,6 +766,23 @@ def main():
                 virtual_cam.send(out_formatted)
                 virtual_cam.sleep_until_next_frame()
 
+            # Render interactive GUI preview window if enabled
+            if preview_enabled:
+                display_frame = out_formatted.copy()
+                if time.perf_counter() < recalibration_feedback_time:
+                    cv2.putText(display_frame, "POSE CENTRADA / RECALIBRADA", (20, 35),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 100), 2, cv2.LINE_AA)
+                cv2.imshow(window_name, display_frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord('c'), ord('C')):
+                    pipeline.x_d_0_info = None
+                    pipeline.last_lmk = None
+                    recalibration_feedback_time = time.perf_counter() + 1.2
+                    print("[*] [Preview 'c'] Pose neutral centrada y recalibrada.")
+                elif key in (ord('q'), ord('Q'), 27):  # 27 = ESC
+                    print("[*] [Preview 'q'] Cerrando LivePortrait...")
+                    running = False
+
             # Measure performance
             t_frame_end = time.perf_counter()
             frame_ms = (t_frame_end - t_frame_start) * 1000.0
@@ -620,34 +796,28 @@ def main():
                 status_str = "TRACKING OK" if pipeline.is_tracking else "NO ROSTRO DETECTADO"
                 print(f"[*] Latency: {frame_ms:.1f} ms | GPU Infer: {avg_infer:.1f} ms | Effective: {recent_fps:.1f} FPS | Estado: {status_str}")
 
-            # Local preview window if requested (includes PiP camera and status HUD)
-            if args.preview:
-                try:
-                    preview_img = draw_preview_hud(
-                        avatar_bgr=out_formatted,
-                        cam_bgr=frame_bgr,
-                        is_tracking=pipeline.is_tracking,
-                        is_calibrated=(pipeline.x_d_0_info is not None),
-                        brightness=frame_bgr.mean(),
-                        driving_mult=pipeline.driving_multiplier
-                    )
-                    cv2.imshow("LivePortrait Avatar Preview (Press q to exit)", preview_img)
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord('c'):
-                        pipeline.x_d_0_info = None  # Trigger recalibration
-                        pipeline.last_lmk = None
-                        print("[*] Calibración reseteada. Mira de frente a la cámara con pose neutral...")
-                    elif key in [ord('-'), ord('_')]:
-                        pipeline.driving_multiplier = max(0.20, round(pipeline.driving_multiplier - 0.05, 2))
-                        print(f"[*] Sensibilidad reducida a: {pipeline.driving_multiplier:.2f}")
-                    elif key in [ord('+'), ord('='), ord(']')]:
-                        pipeline.driving_multiplier = min(1.20, round(pipeline.driving_multiplier + 0.05, 2))
-                        print(f"[*] Sensibilidad aumentada a: {pipeline.driving_multiplier:.2f}")
-                except cv2.error as e:
-                    print(f"[!] Warning: GUI display error in cv2.imshow ({e}). Disabling preview.")
-                    args.preview = False
+            # Comandos por stdin (recalibrar / sensibilidad / salir) sin bloquear el loop
+            cmd = stdin_listener.poll()
+            if cmd == "c":
+                pipeline.x_d_0_info = None  # Fuerza recalibración en el próximo frame válido
+                pipeline.last_lmk = None
+                recalibration_feedback_time = time.perf_counter() + 1.2
+                print("[*] [Terminal 'c'] Recalibrando... mira de frente a la cámara con pose neutral.")
+            elif cmd in ("q", "quit", "exit"):
+                print("[*] [Terminal 'q'] Cerrando LivePortrait...")
+                running = False
+            elif cmd == "m+":
+                pipeline.driving_multiplier = min(1.20, round(pipeline.driving_multiplier + 0.05, 2))
+                print(f"[*] Sensibilidad de cabeza: {pipeline.driving_multiplier:.2f}")
+            elif cmd == "m-":
+                pipeline.driving_multiplier = max(0.20, round(pipeline.driving_multiplier - 0.05, 2))
+                print(f"[*] Sensibilidad de cabeza: {pipeline.driving_multiplier:.2f}")
+            elif cmd == "l+":
+                pipeline.lip_multiplier = min(3.00, round(pipeline.lip_multiplier + 0.10, 2))
+                print(f"[*] Sensibilidad de labios: {pipeline.lip_multiplier:.2f}")
+            elif cmd == "l-":
+                pipeline.lip_multiplier = max(0.20, round(pipeline.lip_multiplier - 0.10, 2))
+                print(f"[*] Sensibilidad de labios: {pipeline.lip_multiplier:.2f}")
 
             # Check dry-run duration limit
             if args.dry_run > 0 and (time.perf_counter() - t_start) >= args.dry_run:
@@ -656,15 +826,12 @@ def main():
 
     finally:
         total_time = time.perf_counter() - t_start
+        if preview_enabled:
+            cv2.destroyAllWindows()
         if cap.isOpened():
             cap.release()
         if virtual_cam is not None:
             virtual_cam.close()
-        if args.preview:
-            try:
-                cv2.destroyAllWindows()
-            except Exception:
-                pass
 
         if latency_records:
             avg_latency = np.mean([x[0] for x in latency_records])

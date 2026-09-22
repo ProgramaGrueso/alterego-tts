@@ -89,11 +89,19 @@ Comprobará:
 
 ## 🎥 Uso
 
-### Ejecución básica
-Inicia la cámara virtual usando la imagen de avatar por defecto (`sample_avatar.jpg` o `avatar.png`):
+### Ejecución rápida (Comando Global)
+Puedes iniciar la aplicación directamente desde cualquier terminal ejecutando:
 
 ```bash
-python run_live_cam.py --preview
+avatar
+```
+
+*(Consulta [`AVATAR_CLI.md`](file:///run/media/juang/Datos/Proyecto/avatar/AVATAR_CLI.md) para detalles completos de arquitectura y opciones).*
+
+O invocando directamente el script con Python:
+
+```bash
+python run_live_cam.py
 ```
 
 ### Opciones y Parámetros Principales
@@ -104,7 +112,7 @@ python run_live_cam.py \
   --webcam-id 0 \
   --output-device /dev/video2 \
   --fps 30 \
-  --driving-multiplier 0.65 \
+  --driving-multiplier 0.50 \
   --pasteback \
   --preview
 ```
@@ -115,7 +123,8 @@ python run_live_cam.py \
 | `--webcam-id`, `-w` | ID numérico (ej. `0`) o nodo (`/dev/video0`) de tu webcam real | `0` |
 | `--output-device`, `-o` | Nodo de la cámara virtual V4L2 | `/dev/video2` |
 | `--fps` | Tasa de fotogramas objetivo | `30` |
-| `--driving-multiplier`, `-m` | Intensidad de la expresión facial (0.50 - 0.70 es óptimo) | `0.65` |
+| `--driving-multiplier`, `-m` | Intensidad de movimiento de cabeza y rostro (0.40 - 0.60 es óptimo) | `0.50` |
+| `--lip-multiplier` | Articulación de labios (fonemas/habla) | `1.00` |
 | `--pasteback` | Re-inserta el rostro en el retrato completo con fondo | Desactivado |
 | `--preview` | Muestra una ventana local de OpenCV para previsualización | Desactivado |
 | `--compile` | Activa `torch.compile` para máxima tasa de FPS | Desactivado |
