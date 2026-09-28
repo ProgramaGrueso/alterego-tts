@@ -33,3 +33,10 @@ pyyaml
 tqdm
 tyro
 rich
+
+# Opcional: detector alternativo (--detector mediapipe)
+# mediapipe>=0.10
+
+# Opcional: backend TensorRT (--backend trt). NO usar pacman (trae TRT 10.x). Ver README.
+# uv pip install --extra-index-url https://pypi.nvidia.com --index-strategy unsafe-best-match \
+#     "tensorrt-bindings==8.6.1" "tensorrt-libs==8.6.1"

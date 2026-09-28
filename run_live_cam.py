@@ -24,6 +24,8 @@ import torch.nn.functional as F
 # Ensure liveportrait_src is discoverable in PYTHONPATH
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(CURRENT_DIR, "liveportrait_src")
+DEFAULT_TRT_DIR = os.path.join(SRC_DIR, "pretrained_weights/faster_liveportrait/trt_engines")
+DEFAULT_MEDIAPIPE_MODEL = os.path.join(SRC_DIR, "pretrained_weights/mediapipe/face_landmarker.task")
 if SRC_DIR not in sys.path:
     sys.path.insert(0, SRC_DIR)
 
@@ -93,8 +95,37 @@ def soft_deadband(x: torch.Tensor, threshold: float, floor_gain: float) -> torch
     return x * (floor_gain + (1.0 - floor_gain) * (u * u * (3.0 - 2.0 * u)))
 
 
+class MediaPipeFaceDetector:
+    """
+    Detector alternativo a InsightFace (--detector mediapipe): FaceLandmarker de MediaPipe
+    (478 puntos, CPU). Los puntos solo se usan como prior para el recorte del LandmarkRunner,
+    igual que los 106 puntos de InsightFace, así que el seguimiento posterior no cambia.
+    """
+    def __init__(self, model_path: str):
+        import mediapipe as mp
+        from mediapipe.tasks import python as mp_tasks
+        from mediapipe.tasks.python import vision
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Modelo MediaPipe no encontrado: {model_path} (ver README)")
+        self._mp = mp
+        opts = vision.FaceLandmarkerOptions(
+            base_options=mp_tasks.BaseOptions(model_asset_path=model_path),
+            running_mode=vision.RunningMode.IMAGE,
+            num_faces=1,
+        )
+        self.landmarker = vision.FaceLandmarker.create_from_options(opts)
+
+    def detect(self, frame_rgb: np.ndarray):
+        img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(frame_rgb))
+        res = self.landmarker.detect(img)
+        if not res.face_landmarks:
+            return None
+        h, w = frame_rgb.shape[:2]
+        return np.array([[p.x * w, p.y * h] for p in res.face_landmarks[0]], dtype=np.float32)
+
+
 class LivePortraitCamPipeline:
-    def __init__(self, source_image_path: str, device_id: int = 0, flag_pasteback: bool = False, flag_compile: bool = False, driving_multiplier: float = 0.50, skin_noise: float = 2.5, flag_fp32_generator: bool = False, flag_lip_retargeting: bool = True, lip_multiplier: float = 1.00, flag_seamless: bool = False, output_size=(640, 480)):
+    def __init__(self, source_image_path: str, device_id: int = 0, flag_pasteback: bool = False, flag_compile: bool = False, driving_multiplier: float = 0.50, skin_noise: float = 2.5, flag_fp32_generator: bool = False, flag_lip_retargeting: bool = True, lip_multiplier: float = 1.00, flag_seamless: bool = False, output_size=(640, 480), backend: str = "torch", detector: str = "insightface", trt_engine_dir: str = None):
         self.device_id = device_id
         self.flag_pasteback = flag_pasteback
         self.flag_seamless = flag_seamless
@@ -246,6 +277,16 @@ class LivePortraitCamPipeline:
 
         print("[+] Source avatar features pre-computed and cached in VRAM.")
 
+        # Backend TensorRT opcional: sustituye los módulos del wrapper por motores TRT
+        self.backend = backend
+        if backend == "trt":
+            from trt_backend import install_trt_backend
+            install_trt_backend(self.wrapper, self.cropper, trt_engine_dir or DEFAULT_TRT_DIR)
+
+        # Detector de rostro para (re)adquisición
+        self.detector = detector
+        self.mp_detector = MediaPipeFaceDetector(DEFAULT_MEDIAPIPE_MODEL) if detector == "mediapipe" else None
+
         # Reference driving motion cache (calibrated on initial detection)
         self.x_d_0_info = None
         self.R_d_0 = None
@@ -361,6 +402,9 @@ class LivePortraitCamPipeline:
         return frame
 
     def _detect_landmarks(self, frame_bgr, frame_rgb):
+        if self.mp_detector is not None:
+            prior = self.mp_detector.detect(frame_rgb)
+            return None if prior is None else self.cropper.human_landmark_runner.run(frame_rgb, prior)
         src_face = self.cropper.face_analysis_wrapper.get(
             frame_bgr, flag_do_landmark_2d_106=True, direction="large-small"
         )
@@ -674,6 +718,12 @@ def parse_args():
                         help="Run in benchmark mode for N seconds and exit with FPS statistics.")
     parser.add_argument("--no-virtualcam", action="store_true",
                         help="Disable virtual camera output (useful for testing without v4l2loopback).")
+    parser.add_argument("--backend", choices=["torch", "trt"], default="torch",
+                        help="Inference backend: torch (default) or trt (TensorRT engines, see README).")
+    parser.add_argument("--trt-engine-dir", type=str, default=DEFAULT_TRT_DIR,
+                        help=f"Directory with the TensorRT engines + GridSample3D plugin (default: {DEFAULT_TRT_DIR}).")
+    parser.add_argument("--detector", choices=["insightface", "mediapipe"], default="insightface",
+                        help="Face detector used for (re)acquisition (default: insightface).")
     parser.add_argument("--driving-video", type=str, default=None,
                         help="Use a video file (looped at its native FPS) instead of the webcam. Reproducible benchmarks.")
     return parser.parse_args()
@@ -880,6 +930,8 @@ def main():
     print(f" Lip Retargeting:  {args.lip_retargeting}")
     print(f" Skin Grain Noise: {args.skin_noise}")
     print(f" FP32 Generator:   {args.fp32_generator}")
+    print(f" Backend:          {args.backend}")
+    print(f" Face Detector:    {args.detector}")
     print("=" * 65)
 
     # 1. Initialize Webcam (en hilo separado para no bloquear el loop de inferencia)
@@ -912,7 +964,10 @@ def main():
         flag_lip_retargeting=args.lip_retargeting,
         lip_multiplier=args.lip_multiplier,
         flag_seamless=args.seamless,
-        output_size=(out_w, out_h)
+        output_size=(out_w, out_h),
+        backend=args.backend,
+        detector=args.detector,
+        trt_engine_dir=args.trt_engine_dir
     )
 
     # 3. Initialize Virtual Camera (pyvirtualcam)
