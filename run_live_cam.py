@@ -19,6 +19,7 @@ import queue
 import numpy as np
 import cv2
 import torch
+import torch.nn.functional as F
 
 # Ensure liveportrait_src is discoverable in PYTHONPATH
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -93,9 +94,11 @@ def soft_deadband(x: torch.Tensor, threshold: float, floor_gain: float) -> torch
 
 
 class LivePortraitCamPipeline:
-    def __init__(self, source_image_path: str, device_id: int = 0, flag_pasteback: bool = False, flag_compile: bool = False, driving_multiplier: float = 0.50, skin_noise: float = 2.5, flag_fp32_generator: bool = False, flag_lip_retargeting: bool = True, lip_multiplier: float = 1.00):
+    def __init__(self, source_image_path: str, device_id: int = 0, flag_pasteback: bool = False, flag_compile: bool = False, driving_multiplier: float = 0.50, skin_noise: float = 2.5, flag_fp32_generator: bool = False, flag_lip_retargeting: bool = True, lip_multiplier: float = 1.00, flag_seamless: bool = False, output_size=(640, 480)):
         self.device_id = device_id
         self.flag_pasteback = flag_pasteback
+        self.flag_seamless = flag_seamless
+        self.output_size = output_size
         self.driving_multiplier = driving_multiplier
         self.skin_noise = float(skin_noise)
         self.flag_fp32_generator = flag_fp32_generator
@@ -224,22 +227,22 @@ class LivePortraitCamPipeline:
         self.noise_tex = None
 
         # Precompute pasteback mask and seamlessClone ROI if requested
-        if self.flag_pasteback:
+        self.mask_ori_float = None
+        self.paste_bbox = None
+        self.paste_center = None
+        self.mask_roi = None
+        if self.flag_pasteback and self.flag_seamless:
             h, w = self.source_rgb.shape[:2]
             self.mask_ori_float = prepare_paste_back(
                 self.inf_cfg.mask_crop, self.M_c2o, dsize=(w, h)
             )
-            self.mask_u8 = (self.mask_ori_float[..., 0] * 255).astype(np.uint8)
-            bx, by, bw, bh = cv2.boundingRect(self.mask_u8)
+            mask_u8 = (self.mask_ori_float[..., 0] * 255).astype(np.uint8)
+            bx, by, bw, bh = cv2.boundingRect(mask_u8)
             self.paste_bbox = (bx, by, bw, bh)
             self.paste_center = (bx + bw // 2, by + bh // 2)
-            self.mask_roi = self.mask_u8[by:by+bh, bx:bx+bw]
-        else:
-            self.mask_ori_float = None
-            self.mask_u8 = None
-            self.paste_bbox = None
-            self.paste_center = None
-            self.mask_roi = None
+            self.mask_roi = mask_u8[by:by+bh, bx:bx+bw]
+        elif self.flag_pasteback:
+            self._prepare_gpu_pasteback()
 
         print("[+] Source avatar features pre-computed and cached in VRAM.")
 
@@ -258,6 +261,40 @@ class LivePortraitCamPipeline:
         self.recover_since = None    # instante de re-adquisición
         self.kp_recover_from = None  # keypoints mostrados al re-adquirir
         self.reacquired = False
+
+    def _prepare_gpu_pasteback(self, feather_sigma: float = 8.0):
+        """
+        Pasteback en GPU: como M_c2o es fijo, se precalculan una vez la rejilla de muestreo
+        (ROI del fondo -> coordenadas del recorte), la máscara con feather y el fondo.
+        Se compone a la resolución de salida: el avatar puede medir 2048 px pero se emite
+        a 640x480, así que mezclar a resolución completa es trabajo desperdiciado.
+        """
+        h, w = self.source_rgb.shape[:2]
+        out_w, out_h = self.output_size
+        s = min(1.0, max(out_w / w, out_h / h))
+        work_w, work_h = max(1, round(w * s)), max(1, round(h * s))
+        self.paste_bg_bgr = cv2.resize(cv2.cvtColor(self.source_rgb, cv2.COLOR_RGB2BGR),
+                                       (work_w, work_h), interpolation=cv2.INTER_AREA)
+
+        crop_size = self.inf_cfg.mask_crop.shape[0]
+        M = np.diag([s, s, 1.0]) @ np.vstack([self.M_c2o[:2], [0.0, 0.0, 1.0]])
+        mask_crop = self.inf_cfg.mask_crop[..., 0].astype(np.float32) / 255.0
+        mask_crop = cv2.GaussianBlur(mask_crop, (0, 0), feather_sigma)
+        mask_work = cv2.warpAffine(mask_crop, M[:2], (work_w, work_h), flags=cv2.INTER_LINEAR)
+        bx, by, bw, bh = cv2.boundingRect((mask_work > 1e-3).astype(np.uint8))
+        self.paste_bbox = (bx, by, bw, bh)
+
+        # Coordenadas (centros de píxel) del ROI llevadas al espacio del recorte, normalizadas
+        # para grid_sample con align_corners=False (misma convención que cv2.warpAffine)
+        M_inv = np.linalg.inv(M)
+        xs, ys = np.meshgrid(np.arange(bx, bx + bw, dtype=np.float64), np.arange(by, by + bh, dtype=np.float64))
+        cx = M_inv[0, 0] * xs + M_inv[0, 1] * ys + M_inv[0, 2]
+        cy = M_inv[1, 0] * xs + M_inv[1, 1] * ys + M_inv[1, 2]
+        grid = np.stack([(2 * cx + 1) / crop_size - 1, (2 * cy + 1) / crop_size - 1], axis=-1)
+        self.paste_grid = torch.from_numpy(grid[None].astype(np.float32)).to(self.device)
+        self.paste_mask = torch.from_numpy(mask_work[by:by+bh, bx:bx+bw][None, None].copy()).to(self.device)
+        bg_roi = self.paste_bg_bgr[by:by+bh, bx:bx+bw]
+        self.paste_bg_roi = torch.from_numpy(bg_roi.copy()).permute(2, 0, 1)[None].float().to(self.device)
 
     def _reset_smoothers(self):
         for f in (self.smoother_lmk, self.smoother_angles, self.smoother_exp_face,
@@ -473,9 +510,9 @@ class LivePortraitCamPipeline:
             x_d_i_new = self.wrapper.stitching(self.x_s, x_d_i_new).half()
         return x_d_i_new
 
-    def _postprocess(self, out: torch.Tensor) -> np.ndarray:
-        """1x3xHxW float [0,1] en GPU -> HxWx3 uint8 RGB en CPU, con grano de piel aplicado en GPU."""
-        out = out * 255.0
+    def _postprocess(self, out: torch.Tensor) -> torch.Tensor:
+        """1x3xHxW float [0,1] RGB -> 1x3xHxW float [0,255] BGR en GPU, con grano de piel aplicado."""
+        out = out.flip(1) * 255.0
         if self.skin_noise > 0.0:
             _, c, h, w = out.shape
             if self.noise_tex is None or self.noise_tex.shape[-2:] != (h + self.NOISE_PAD, w + self.NOISE_PAD):
@@ -483,31 +520,46 @@ class LivePortraitCamPipeline:
                                              device=out.device, dtype=out.dtype) * self.skin_noise
             oy, ox = np.random.randint(0, self.NOISE_PAD + 1, size=2)
             out = out + self.noise_tex[:, :, oy:oy + h, ox:ox + w]
-        out = out.clamp_(0.0, 255.0).to(torch.uint8)
-        return out[0].permute(1, 2, 0).contiguous().cpu().numpy()
+        return out
+
+    @staticmethod
+    def _to_numpy_u8(img: torch.Tensor) -> np.ndarray:
+        """1x3xHxW float [0,255] en GPU -> HxWx3 uint8 en CPU."""
+        return img.clamp_(0.0, 255.0).to(torch.uint8)[0].permute(1, 2, 0).contiguous().cpu().numpy()
 
     def _render(self, kp: torch.Tensor) -> np.ndarray:
         """Warping + SPADE decoding de unos keypoints de conducción y composición final (BGR)."""
         self.last_kp_out = kp
         out = self.wrapper.warp_decode(self.f_s, self.x_s, kp)
-        out_crop = self._postprocess(out["out"])  # HxWx3 uint8 RGB
+        out_bgr = self._postprocess(out["out"])
 
-        # 10. Formatting and Pasteback (with seamlessClone & fallback)
-        if self.flag_pasteback and self.mask_ori_float is not None:
-            try:
-                dsize = (self.source_rgb.shape[1], self.source_rgb.shape[0])
-                transformed_crop = _transform_img(out_crop, self.M_c2o, dsize=dsize)
-                bx, by, bw, bh = self.paste_bbox
-                if bw > 0 and bh > 0:
-                    src_roi = transformed_crop[by:by+bh, bx:bx+bw]
-                    out_full = cv2.seamlessClone(src_roi, self.source_rgb, self.mask_roi, self.paste_center, cv2.NORMAL_CLONE)
-                else:
-                    out_full = paste_back(out_crop, self.M_c2o, self.source_rgb, self.mask_ori_float)
-            except Exception:
+        if not self.flag_pasteback:
+            return self._to_numpy_u8(out_bgr)
+
+        if not self.flag_seamless:
+            # 10. Pasteback GPU: alpha blend con máscara difuminada sobre el ROI precomputado
+            face = F.grid_sample(out_bgr, self.paste_grid, mode="bilinear",
+                                 padding_mode="zeros", align_corners=False)
+            blended = self.paste_bg_roi + self.paste_mask * (face - self.paste_bg_roi)
+            bx, by, bw, bh = self.paste_bbox
+            out_full = self.paste_bg_bgr.copy()
+            out_full[by:by+bh, bx:bx+bw] = self._to_numpy_u8(blended)
+            return out_full
+
+        # 10b. Pasteback clásico con seamlessClone (--seamless), a resolución completa del avatar
+        out_crop = cv2.cvtColor(self._to_numpy_u8(out_bgr), cv2.COLOR_BGR2RGB)
+        try:
+            dsize = (self.source_rgb.shape[1], self.source_rgb.shape[0])
+            transformed_crop = _transform_img(out_crop, self.M_c2o, dsize=dsize)
+            bx, by, bw, bh = self.paste_bbox
+            if bw > 0 and bh > 0:
+                src_roi = transformed_crop[by:by+bh, bx:bx+bw]
+                out_full = cv2.seamlessClone(src_roi, self.source_rgb, self.mask_roi, self.paste_center, cv2.NORMAL_CLONE)
+            else:
                 out_full = paste_back(out_crop, self.M_c2o, self.source_rgb, self.mask_ori_float)
-            return cv2.cvtColor(out_full, cv2.COLOR_RGB2BGR)
-        else:
-            return cv2.cvtColor(out_crop, cv2.COLOR_RGB2BGR)
+        except Exception:
+            out_full = paste_back(out_crop, self.M_c2o, self.source_rgb, self.mask_ori_float)
+        return cv2.cvtColor(out_full, cv2.COLOR_RGB2BGR)
 
 def format_frame_for_output(frame: np.ndarray, target_w: int = 640, target_h: int = 480, is_pasteback: bool = False) -> np.ndarray:
     """
@@ -602,6 +654,8 @@ def parse_args():
                         help="Target streaming frame rate (default: 30).")
     parser.add_argument("--pasteback", action="store_true",
                         help="Paste animated face back into full portrait frame.")
+    parser.add_argument("--seamless", action="store_true",
+                        help="With --pasteback: use cv2.seamlessClone at full avatar resolution instead of the GPU feathered alpha blend (much slower).")
     parser.add_argument("--compile", action="store_true",
                         help="Enable torch.compile for maximum inference speed (>40-60 FPS).")
     parser.add_argument("--driving-multiplier", "-m", type=float, default=0.50,
@@ -625,16 +679,17 @@ def parse_args():
     return parser.parse_args()
 
 
-class ThreadedWebcam:
+class LatestFrameSource:
     """
-    Lee la webcam en un hilo aparte y siempre expone el frame MÁS RECIENTE.
-    Evita que el loop de inferencia GPU tenga que esperar a cap.read() cada
-    vez, que es la causa más común de "stutter" en pipelines real-time.
+    Base para fuentes leídas en un hilo aparte que exponen siempre el frame MÁS RECIENTE.
+    read(wait_new=True) bloquea (con timeout) hasta que llegue un frame que aún no se
+    procesó, para no gastar GPU re-procesando duplicados ni añadir latencia de cola.
     """
-    def __init__(self, cap):
-        self.cap = cap
+    def _start(self):
         self.frame = None
-        self.lock = threading.Lock()
+        self.seq = 0
+        self.consumed = 0
+        self.cond = threading.Condition()
         self.running = True
         self.thread = threading.Thread(target=self._reader, daemon=True)
         self.thread.start()
@@ -644,27 +699,48 @@ class ThreadedWebcam:
                 break
             time.sleep(0.02)
 
-    def _reader(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if ret and frame is not None:
-                with self.lock:
-                    self.frame = frame
+    def _publish(self, frame):
+        with self.cond:
+            self.frame = frame
+            self.seq += 1
+            self.cond.notify_all()
 
-    def read(self):
-        with self.lock:
+    def read(self, wait_new=False, timeout=0.25):
+        with self.cond:
+            if wait_new:
+                self.cond.wait_for(lambda: self.seq != self.consumed or not self.running, timeout)
+            self.consumed = self.seq
             return self.frame is not None, (self.frame.copy() if self.frame is not None else None)
-
-    def isOpened(self):
-        return self.cap.isOpened()
 
     def release(self):
         self.running = False
+        with self.cond:
+            self.cond.notify_all()
         self.thread.join(timeout=1.0)
         self.cap.release()
 
 
-class LoopingVideoSource:
+class ThreadedWebcam(LatestFrameSource):
+    """
+    Lee la webcam en un hilo aparte y siempre expone el frame MÁS RECIENTE.
+    Evita que el loop de inferencia GPU tenga que esperar a cap.read() cada
+    vez, que es la causa más común de "stutter" en pipelines real-time.
+    """
+    def __init__(self, cap):
+        self.cap = cap
+        self._start()
+
+    def _reader(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                self._publish(frame)
+
+    def isOpened(self):
+        return self.cap.isOpened()
+
+
+class LoopingVideoSource(LatestFrameSource):
     """
     Fuente de conducción reproducible para benchmarks: reproduce un vídeo en
     bucle a su FPS nativo en un hilo aparte y expone siempre el frame más
@@ -676,15 +752,7 @@ class LoopingVideoSource:
             raise FileNotFoundError(f"No se pudo abrir el vídeo de conducción: {path}")
         fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.period = 1.0 / (fps if fps and fps > 0 else 30.0)
-        self.frame = None
-        self.lock = threading.Lock()
-        self.running = True
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
-        for _ in range(50):
-            if self.frame is not None:
-                break
-            time.sleep(0.02)
+        self._start()
 
     def _reader(self):
         t_next = time.perf_counter()
@@ -693,8 +761,7 @@ class LoopingVideoSource:
             if not ret:
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 continue
-            with self.lock:
-                self.frame = frame
+            self._publish(frame)
             t_next += self.period
             delay = t_next - time.perf_counter()
             if delay > 0:
@@ -702,17 +769,40 @@ class LoopingVideoSource:
             else:
                 t_next = time.perf_counter()
 
-    def read(self):
-        with self.lock:
-            return self.frame is not None, (self.frame.copy() if self.frame is not None else None)
-
     def isOpened(self):
         return self.running
 
-    def release(self):
+
+class VirtualCamSender:
+    """
+    Envía a la cámara virtual desde un hilo propio, a ritmo constante, siempre el
+    último frame listo (repitiéndolo si la inferencia aún no produjo uno nuevo).
+    Así el loop de inferencia nunca se bloquea en send()/sleep_until_next_frame().
+    """
+    def __init__(self, cam):
+        self.cam = cam
+        self.frame = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def submit(self, frame):
+        with self.lock:
+            self.frame = frame
+
+    def _loop(self):
+        while self.running:
+            with self.lock:
+                frame = self.frame
+            if frame is not None:
+                self.cam.send(frame)
+            self.cam.sleep_until_next_frame()
+
+    def close(self):
         self.running = False
         self.thread.join(timeout=1.0)
-        self.cap.release()
+        self.cam.close()
 
 
 def check_camera_locks(device_path):
@@ -783,7 +873,7 @@ def main():
     print(f" Physical Webcam:  {args.webcam_id}")
     print(f" Virtual Output:   {args.output_device}")
     print(f" Target FPS:       {args.fps}")
-    print(f" Full Pasteback:   {args.pasteback}")
+    print(f" Full Pasteback:   {args.pasteback}{' (seamlessClone)' if args.seamless else ''}")
     print(f" Torch Compile:    {args.compile}")
     print(f" Motion Mult:      {args.driving_multiplier}")
     print(f" Lip Mult:         {args.lip_multiplier}")
@@ -807,6 +897,9 @@ def main():
     else:
         cap = ThreadedWebcam(cap_raw)
 
+    # Standard webcam output dimensions (640x480) for Zoom / WebRTC compatibility
+    out_w, out_h = 640, 480
+
     # 2. Initialize LivePortrait Pipeline
     pipeline = LivePortraitCamPipeline(
         source_image_path=args.source_image,
@@ -817,25 +910,25 @@ def main():
         skin_noise=args.skin_noise,
         flag_fp32_generator=args.fp32_generator,
         flag_lip_retargeting=args.lip_retargeting,
-        lip_multiplier=args.lip_multiplier
+        lip_multiplier=args.lip_multiplier,
+        flag_seamless=args.seamless,
+        output_size=(out_w, out_h)
     )
-
-    # Standard webcam output dimensions (640x480) for Zoom / WebRTC compatibility
-    out_w, out_h = 640, 480
 
     # 3. Initialize Virtual Camera (pyvirtualcam)
     virtual_cam = None
     if not args.no_virtualcam:
         try:
             import pyvirtualcam
-            virtual_cam = pyvirtualcam.Camera(
+            cam = pyvirtualcam.Camera(
                 width=out_w,
                 height=out_h,
                 fps=args.fps,
                 device=args.output_device,
                 fmt=pyvirtualcam.PixelFormat.BGR
             )
-            print(f"[+] Streaming to Virtual Camera active on: {virtual_cam.device} ({out_w}x{out_h} @ {args.fps} FPS)")
+            virtual_cam = VirtualCamSender(cam)
+            print(f"[+] Streaming to Virtual Camera active on: {cam.device} ({out_w}x{out_h} @ {args.fps} FPS)")
         except Exception as e:
             print(f"[!] Warning: Failed to open virtual camera ({args.output_device}): {e}")
             print("    Continuing with live processing and metrics...")
@@ -874,20 +967,22 @@ def main():
     frame_count = 0
     t_start = time.perf_counter()
     latency_records = []
+    frame_times = []
     recalibration_feedback_time = 0.0
 
     try:
         while running:
-            t_frame_start = time.perf_counter()
-
-            # Read webcam frame
-            if cap.isOpened():
-                ret, frame_bgr = cap.read()
+            # Read webcam frame: espera un frame NUEVO (no re-procesa duplicados)
+            if cap is not None and cap.isOpened():
+                ret, frame_bgr = cap.read(wait_new=True)
                 if not ret or frame_bgr is None:
                     continue
             else:
                 # Synthetic dummy face for headless / dry-run testing
                 frame_bgr = cv2.resize(cv2.imread(args.source_image), (640, 480))
+
+            # La latencia se mide desde que el frame está disponible (sin la espera a la cámara)
+            t_frame_start = time.perf_counter()
 
             # Run inference
             t_infer_start = time.perf_counter()
@@ -907,9 +1002,9 @@ def main():
             out_formatted = format_frame_for_output(out_bgr, out_w, out_h, is_pasteback=args.pasteback)
 
             # Send clean, unadorned video stream to virtual cam for Zoom/Discord/WebRTC
+            # (el envío a ritmo constante lo hace el hilo de VirtualCamSender)
             if virtual_cam is not None:
-                virtual_cam.send(out_formatted)
-                virtual_cam.sleep_until_next_frame()
+                virtual_cam.submit(out_formatted)
 
             # Render interactive GUI preview window if enabled
             if preview_enabled:
@@ -933,10 +1028,11 @@ def main():
             frame_ms = (t_frame_end - t_frame_start) * 1000.0
             infer_ms = (t_infer_end - t_infer_start) * 1000.0
             latency_records.append((frame_ms, infer_ms))
+            frame_times.append(t_frame_end)
             frame_count += 1
 
             if frame_count % 30 == 0:
-                recent_fps = 1000.0 / np.mean([x[0] for x in latency_records[-30:]])
+                recent_fps = 29.0 / max(frame_times[-1] - frame_times[-30], 1e-6)
                 avg_infer = np.mean([x[1] for x in latency_records[-30:]])
                 status_str = "TRACKING OK" if pipeline.is_tracking else "NO ROSTRO DETECTADO"
                 print(f"[*] Latency: {frame_ms:.1f} ms | GPU Infer: {avg_infer:.1f} ms | Effective: {recent_fps:.1f} FPS | Estado: {status_str}")
@@ -973,7 +1069,7 @@ def main():
         total_time = time.perf_counter() - t_start
         if preview_enabled:
             cv2.destroyAllWindows()
-        if cap.isOpened():
+        if cap is not None and cap.isOpened():
             cap.release()
         if virtual_cam is not None:
             virtual_cam.close()
