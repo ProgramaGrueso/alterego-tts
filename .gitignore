@@ -30,3 +30,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Benchmark logs (the .txt summaries are versioned)
+bench/results/*.log

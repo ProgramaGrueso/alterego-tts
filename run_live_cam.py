@@ -531,6 +531,8 @@ def parse_args():
                         help="Run in benchmark mode for N seconds and exit with FPS statistics.")
     parser.add_argument("--no-virtualcam", action="store_true",
                         help="Disable virtual camera output (useful for testing without v4l2loopback).")
+    parser.add_argument("--driving-video", type=str, default=None,
+                        help="Use a video file (looped at its native FPS) instead of the webcam. Reproducible benchmarks.")
     return parser.parse_args()
 
 
@@ -566,6 +568,57 @@ class ThreadedWebcam:
 
     def isOpened(self):
         return self.cap.isOpened()
+
+    def release(self):
+        self.running = False
+        self.thread.join(timeout=1.0)
+        self.cap.release()
+
+
+class LoopingVideoSource:
+    """
+    Fuente de conducción reproducible para benchmarks: reproduce un vídeo en
+    bucle a su FPS nativo en un hilo aparte y expone siempre el frame más
+    reciente, igual que ThreadedWebcam con una webcam real.
+    """
+    def __init__(self, path):
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened():
+            raise FileNotFoundError(f"No se pudo abrir el vídeo de conducción: {path}")
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.period = 1.0 / (fps if fps and fps > 0 else 30.0)
+        self.frame = None
+        self.lock = threading.Lock()
+        self.running = True
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        self.thread.start()
+        for _ in range(50):
+            if self.frame is not None:
+                break
+            time.sleep(0.02)
+
+    def _reader(self):
+        t_next = time.perf_counter()
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                continue
+            with self.lock:
+                self.frame = frame
+            t_next += self.period
+            delay = t_next - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                t_next = time.perf_counter()
+
+    def read(self):
+        with self.lock:
+            return self.frame is not None, (self.frame.copy() if self.frame is not None else None)
+
+    def isOpened(self):
+        return self.running
 
     def release(self):
         self.running = False
@@ -651,8 +704,11 @@ def main():
     print("=" * 65)
 
     # 1. Initialize Webcam (en hilo separado para no bloquear el loop de inferencia)
-    cap_raw = open_webcam_robust(args.webcam_id, args.fps)
-    if cap_raw is None:
+    cap_raw = None if args.driving_video else open_webcam_robust(args.webcam_id, args.fps)
+    if args.driving_video:
+        cap = LoopingVideoSource(args.driving_video)
+        print(f"[*] Fuente de conducción: vídeo en bucle {args.driving_video}")
+    elif cap_raw is None:
         if args.dry_run > 0:
             print("[*] Generating synthetic webcam stream for benchmark dry-run...")
             cap = cap_raw
@@ -843,6 +899,7 @@ def main():
             print(f" Total Frames Processed: {frame_count}")
             print(f" Elapsed Time:           {total_time:.2f} s")
             print(f" Average Total Latency:  {avg_latency:.2f} ms/frame")
+            print(f" P95 Total Latency:      {np.percentile([x[0] for x in latency_records], 95):.2f} ms/frame")
             print(f" Average GPU Inference:  {avg_infer:.2f} ms/frame")
             print(f" Throughput:             {actual_fps:.2f} FPS")
             print("=" * 65)
