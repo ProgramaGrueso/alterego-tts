@@ -845,8 +845,11 @@ class VirtualCamSender:
         while self.running:
             with self.lock:
                 frame = self.frame
-            if frame is not None:
-                self.cam.send(frame)
+            if frame is None:
+                # Aún no hay frame: sleep_until_next_frame() falla si no se ha enviado ninguno
+                time.sleep(0.005)
+                continue
+            self.cam.send(frame)
             self.cam.sleep_until_next_frame()
 
     def close(self):
