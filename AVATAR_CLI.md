@@ -25,7 +25,7 @@ Se creó un script ejecutable Bash en [`/home/juang/.local/bin/avatar`](file:///
 #!/usr/bin/env bash
 set -e
 
-PROJECT_DIR="/run/media/juang/Datos/Proyecto/avatar"
+PROJECT_DIR="/mnt/Datos/Proyecto/avatar"
 VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
 MAIN_SCRIPT="$PROJECT_DIR/run_live_cam.py"
 
@@ -62,7 +62,7 @@ Se le otorgaron permisos de ejecución mediante:
 chmod +x /home/juang/.local/bin/avatar
 ```
 
-### B. Ajustes en [`run_live_cam.py`](file:///run/media/juang/Datos/Proyecto/avatar/run_live_cam.py)
+### B. Ajustes en [`run_live_cam.py`](file:///mnt/Datos/Proyecto/avatar/run_live_cam.py)
 
 1. **Resolución de ruta del avatar canónico**:
    Se implementó la función `find_default_source_image()` para localizar de manera absoluta los archivos de imagen dentro del proyecto (`avatar.png`, `avatar2.png` o `sample_avatar.jpg`), evitando errores de archivo no encontrado al ejecutar desde directorios ajenos (como `~` o `/tmp`).
