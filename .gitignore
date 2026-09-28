@@ -33,3 +33,11 @@ Thumbs.db
 
 # Benchmark logs (the .txt summaries are versioned)
 bench/results/*.log
+
+# Personal photos / avatars (never commit)
+/*.png
+/*.jpg
+/*.jpeg
+backup_photos/
+imgs/
+avatars/
