@@ -1,0 +1,9 @@
+ PERFORMANCE BENCHMARK SUMMARY
+=================================================================
+ Total Frames Processed: 21
+ Elapsed Time:           30.42 s
+ Average Total Latency:  1448.73 ms/frame
+ P95 Total Latency:      1529.98 ms/frame
+ Average GPU Inference:  1438.83 ms/frame
+ Throughput:             0.69 FPS
+=================================================================

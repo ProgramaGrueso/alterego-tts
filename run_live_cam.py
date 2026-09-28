@@ -78,6 +78,20 @@ class OneEuroFilter:
         self.dx_prev = None
 
 
+def smoothstep(u: float) -> float:
+    u = min(max(u, 0.0), 1.0)
+    return u * u * (3.0 - 2.0 * u)
+
+
+def soft_deadband(x: torch.Tensor, threshold: float, floor_gain: float) -> torch.Tensor:
+    """
+    Deadband continuo: la ganancia sube de `floor_gain` (en 0) a 1 (en |x| >= threshold)
+    siguiendo un smoothstep, sin el escalón que producía torch.where en el umbral.
+    """
+    u = torch.clamp(torch.abs(x) / threshold, 0.0, 1.0)
+    return x * (floor_gain + (1.0 - floor_gain) * (u * u * (3.0 - 2.0 * u)))
+
+
 class LivePortraitCamPipeline:
     def __init__(self, source_image_path: str, device_id: int = 0, flag_pasteback: bool = False, flag_compile: bool = False, driving_multiplier: float = 0.50, skin_noise: float = 2.5, flag_fp32_generator: bool = False, flag_lip_retargeting: bool = True, lip_multiplier: float = 1.00):
         self.device_id = device_id
@@ -91,6 +105,12 @@ class LivePortraitCamPipeline:
         # Facial keypoint indices in LivePortrait latent expression space
         self.LIP_INDICES = [6, 12, 14, 17, 19, 20]
         self.FACE_INDICES = [i for i in range(21) if i not in self.LIP_INDICES]
+        self.device = f"cuda:{device_id}"
+
+        # Duración del fade a pose neutra al perder el rostro (y del retorno al recuperarlo)
+        self.FADE_S = 0.30
+        # Límites del dt real entre frames que se pasa a los filtros One-Euro
+        self.DT_MIN, self.DT_MAX = 1.0 / 120.0, 1.0 / 10.0
 
         # Anti-jitter One-Euro filters tailored for each facial/pose component
         self.smoother_lmk = OneEuroFilter(min_cutoff=0.8, beta=0.02)
@@ -175,13 +195,33 @@ class LivePortraitCamPipeline:
 
         # Precompute source eye ratio for blinking retargeting
         self.c_s_eyes = calc_eye_close_ratio(self.source_lmk[None])
-        self.c_s_eyes_tensor = torch.from_numpy(self.c_s_eyes).half().to(f"cuda:{device_id}")
+        self.c_s_eyes_tensor = torch.from_numpy(self.c_s_eyes).half().to(self.device)
         self.c_s_eye_mean = float(self.c_s_eyes.mean())
         self.c_d_eye_0 = None
+        self.c_d_lip_0 = None
 
         # Precompute source lip ratio for lip retargeting
         self.c_s_lip = calc_lip_close_ratio(self.source_lmk[None])
-        self.c_s_lip_tensor = torch.from_numpy(self.c_s_lip).half().to(f"cuda:{device_id}")
+        self.c_s_lip_tensor = torch.from_numpy(self.c_s_lip).half().to(self.device)
+
+        # Buffers preasignados para los ratios de ojos/labios: [fuente | conducción].
+        # La columna de conducción se rellena por frame con fill_() (sin torch.tensor().to()).
+        n_eye = self.c_s_eyes_tensor.shape[1]
+        self.eye_ratio_buf = torch.empty((1, n_eye + 1), dtype=torch.float16, device=self.device)
+        self.eye_ratio_buf[:, :n_eye] = self.c_s_eyes_tensor
+        n_lip = self.c_s_lip_tensor.shape[1]
+        self.lip_ratio_buf = torch.empty((1, n_lip + 1), dtype=torch.float16, device=self.device)
+        self.lip_ratio_buf[:, :n_lip] = self.c_s_lip_tensor
+
+        # Máscara de keypoints labiales para fusionar expresiones sin bucles Python
+        num_kp = self.x_s.shape[1]
+        self.lip_mask = torch.zeros((1, num_kp, 1), dtype=torch.bool, device=self.device)
+        self.lip_mask[:, self.LIP_INDICES] = True
+
+        # Textura de grano de piel generada una sola vez (se crea al conocer la resolución
+        # de salida); cada frame toma un recorte con offset aleatorio para que no quede fija.
+        self.NOISE_PAD = 64
+        self.noise_tex = None
 
         # Precompute pasteback mask and seamlessClone ROI if requested
         if self.flag_pasteback:
@@ -209,6 +249,22 @@ class LivePortraitCamPipeline:
         self.last_lmk = None
         self.is_tracking = False
 
+        # Estado temporal: dt real, pérdida/recuperación de rostro con fade
+        self.t_prev = None
+        self.last_kp_out = None      # últimos keypoints renderizados
+        self.lost_since = None       # instante en que se perdió el rostro
+        self.kp_lost_from = None     # keypoints al perderlo (origen del fade a neutral)
+        self.neutral_frame = None    # frame neutral cacheado tras completar el fade
+        self.recover_since = None    # instante de re-adquisición
+        self.kp_recover_from = None  # keypoints mostrados al re-adquirir
+        self.reacquired = False
+
+    def _reset_smoothers(self):
+        for f in (self.smoother_lmk, self.smoother_angles, self.smoother_exp_face,
+                  self.smoother_exp_lip, self.smoother_t, self.smoother_scale,
+                  self.smoother_eye, self.smoother_lip_seal):
+            f.reset()
+
     def calibrate_neutral_pose(self, x_d_info, lmk):
         """Calibrates neutral expression, eye openness, lip baseline, and head pose from driving webcam."""
         self.x_d_0_info = {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in x_d_info.items()}
@@ -216,25 +272,70 @@ class LivePortraitCamPipeline:
         self.c_d_eye_0 = max(float(r_eyes.mean()), 0.15)
         r_lip = calc_lip_close_ratio(lmk[None])
         self.c_d_lip_0 = max(float(r_lip[0, 0]), 0.02)
-        self.smoother_lmk.reset()
-        self.smoother_angles.reset()
-        self.smoother_exp_face.reset()
-        self.smoother_exp_lip.reset()
-        self.smoother_t.reset()
-        self.smoother_scale.reset()
-        self.smoother_eye.reset()
-        self.smoother_lip_seal.reset()
+        self._reset_smoothers()
         print(f"[+] Pose neutra calibrada (Sensibilidad cabeza: {self.driving_multiplier:.2f} | Labios: {self.lip_multiplier:.2f} | Ojos: {self.c_d_eye_0:.2f} | Boca reposo: {self.c_d_lip_0:.2f}).")
 
     def process_frame(self, frame_bgr: np.ndarray) -> np.ndarray:
         """
         Executes LivePortrait deformation on one driving frame.
-        Returns animated output frame (BGR, uint8).
+        Returns animated output frame (BGR, uint8), or None if nothing has been animated yet.
         """
+        now = time.perf_counter()
+        dt = 1.0 / 30.0 if self.t_prev is None else min(max(now - self.t_prev, self.DT_MIN), self.DT_MAX)
+        self.t_prev = now
+
+        with torch.inference_mode():
+            kp_tracked = self._drive_keypoints(frame_bgr, dt)
+            if kp_tracked is None:
+                self.is_tracking = False
+                return self._render_face_lost(now)
+
+            self.is_tracking = True
+            # Re-adquisición (tras pérdida o recalibración): mezclar desde lo que se mostraba
+            if self.reacquired and self.last_kp_out is not None:
+                self.kp_recover_from = self.last_kp_out
+                self.recover_since = now
+            self.reacquired = False
+            self.lost_since = None
+
+            kp = kp_tracked
+            if self.recover_since is not None:
+                w = smoothstep((now - self.recover_since) / self.FADE_S)
+                kp = torch.lerp(self.kp_recover_from, kp_tracked, w)
+                if w >= 1.0:
+                    self.recover_since = None
+            return self._render(kp)
+
+    def _render_face_lost(self, now: float):
+        """Mantiene el último frame animado y hace un fade suave hacia la pose neutra."""
+        if self.last_kp_out is None:
+            return None  # Aún no se animó nada: el llamador muestra la imagen fuente
+        if self.lost_since is None:
+            self.lost_since = now
+            self.kp_lost_from = self.last_kp_out
+            self.recover_since = None
+        w = smoothstep((now - self.lost_since) / self.FADE_S)
+        if w >= 1.0 and self.neutral_frame is not None:
+            self.last_kp_out = self.x_s
+            return self.neutral_frame
+        frame = self._render(torch.lerp(self.kp_lost_from, self.x_s, w))
+        if w >= 1.0:
+            self.neutral_frame = frame
+        return frame
+
+    def _detect_landmarks(self, frame_bgr, frame_rgb):
+        src_face = self.cropper.face_analysis_wrapper.get(
+            frame_bgr, flag_do_landmark_2d_106=True, direction="large-small"
+        )
+        if len(src_face) == 0:
+            return None
+        return self.cropper.human_landmark_runner.run(frame_rgb, src_face[0].landmark_2d_106)
+
+    def _drive_keypoints(self, frame_bgr: np.ndarray, dt: float):
+        """Seguimiento facial + cálculo de keypoints de conducción. None si no hay rostro."""
         # Safety check: if webcam is covered / pitch dark, report no tracking
         if frame_bgr.mean() < 12.0:
             self.last_lmk = None
-            self.is_tracking = False
             return None
 
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
@@ -242,32 +343,26 @@ class LivePortraitCamPipeline:
         # 1. Face tracking / alignment
         if self.last_lmk is None:
             # First frame or re-acquisition: run detector
-            src_face = self.cropper.face_analysis_wrapper.get(
-                frame_bgr, flag_do_landmark_2d_106=True, direction="large-small"
-            )
-            if len(src_face) == 0:
-                self.is_tracking = False
+            lmk = self._detect_landmarks(frame_bgr, frame_rgb)
+            if lmk is None:
                 return None
-            lmk = src_face[0].landmark_2d_106
-            lmk = self.cropper.human_landmark_runner.run(frame_rgb, lmk)
-            self.last_lmk = lmk
+            self.reacquired = True
+            if self.lost_since is not None:
+                # Estado de filtros obsoleto tras la pérdida: el fade de retorno cubre la continuidad
+                self._reset_smoothers()
         else:
             # Tracking mode: pass previous landmark as prior (fast ONNX execution ~2ms)
             lmk = self.cropper.human_landmark_runner.run(frame_rgb, self.last_lmk)
             if lmk is None or lmk.min() < -50 or lmk.max() > max(frame_bgr.shape[:2]) + 50:
                 # Re-detect if tracking was lost or landmark collapsed
-                src_face = self.cropper.face_analysis_wrapper.get(
-                    frame_bgr, flag_do_landmark_2d_106=True, direction="large-small"
-                )
-                if len(src_face) == 0:
+                lmk = self._detect_landmarks(frame_bgr, frame_rgb)
+                if lmk is None:
                     self.last_lmk = None
-                    self.is_tracking = False
                     return None
-                lmk = self.cropper.human_landmark_runner.run(frame_rgb, src_face[0].landmark_2d_106)
-            self.last_lmk = lmk
+        self.last_lmk = lmk
 
         # Apply temporal smoothing to facial landmarks to eliminate crop jitter
-        lmk = self.smoother_lmk.update(lmk)
+        lmk = self.smoother_lmk.update(lmk, dt)
 
         # 2. Crop 256x256 driving face
         ret_crop = crop_image(
@@ -281,126 +376,121 @@ class LivePortraitCamPipeline:
         )
         if ret_crop["img_crop"].mean() < 10.0:
             self.last_lmk = None
-            self.is_tracking = False
             return None
 
         img_driving_crop_256 = cv2.resize(ret_crop["img_crop"], (256, 256), interpolation=cv2.INTER_AREA)
 
         # 3. Driving keypoints inference
-        with torch.inference_mode():
-            I_d = self.wrapper.prepare_source(img_driving_crop_256).half()
-            x_d_i_info = self.wrapper.get_kp_info(I_d)
+        I_d = self.wrapper.prepare_source(img_driving_crop_256).half()
+        x_d_i_info = self.wrapper.get_kp_info(I_d)
 
-            # Calibrate on first valid face
-            if self.x_d_0_info is None:
-                self.calibrate_neutral_pose(x_d_i_info, lmk)
+        # Calibrate on first valid face
+        if self.x_d_0_info is None:
+            self.calibrate_neutral_pose(x_d_i_info, lmk)
 
-            # 4. Relative Head Rotation (pitch, yaw, roll in degrees)
-            delta_pitch = x_d_i_info["pitch"] - self.x_d_0_info["pitch"]
-            delta_yaw = x_d_i_info["yaw"] - self.x_d_0_info["yaw"]
-            delta_roll = x_d_i_info["roll"] - self.x_d_0_info["roll"]
-            angles_raw = torch.cat([delta_pitch, delta_yaw, delta_roll], dim=-1)
+        # 4. Relative Head Rotation (pitch, yaw, roll in degrees)
+        delta_pitch = x_d_i_info["pitch"] - self.x_d_0_info["pitch"]
+        delta_yaw = x_d_i_info["yaw"] - self.x_d_0_info["yaw"]
+        delta_roll = x_d_i_info["roll"] - self.x_d_0_info["roll"]
+        angles_raw = torch.cat([delta_pitch, delta_yaw, delta_roll], dim=-1)
 
-            # Deadband filter: micro-movements < 0.30 degrees are suppressed (preserves calm posture when still)
-            deadband_angle = 0.30
-            angles_raw = torch.where(torch.abs(angles_raw) < deadband_angle, angles_raw * 0.25, angles_raw)
-            angles_smooth = self.smoother_angles.update(angles_raw)
+        # Deadband continuo: micro-movimientos < 0.30° se atenúan (postura calmada en reposo)
+        angles_raw = soft_deadband(angles_raw, 0.30, 0.25)
+        angles_smooth = self.smoother_angles.update(angles_raw, dt)
 
-            # Apply motion multiplier to rotation
-            angles_damped = angles_smooth * self.driving_multiplier
-            pitch_new = self.x_s_info["pitch"] + angles_damped[:, 0:1]
-            yaw_new = self.x_s_info["yaw"] + angles_damped[:, 1:2]
-            roll_new = self.x_s_info["roll"] + angles_damped[:, 2:3]
-            R_new = get_rotation_matrix(pitch_new, yaw_new, roll_new).half()
+        # Apply motion multiplier to rotation
+        angles_damped = angles_smooth * self.driving_multiplier
+        pitch_new = self.x_s_info["pitch"] + angles_damped[:, 0:1]
+        yaw_new = self.x_s_info["yaw"] + angles_damped[:, 1:2]
+        roll_new = self.x_s_info["roll"] + angles_damped[:, 2:3]
+        R_new = get_rotation_matrix(pitch_new, yaw_new, roll_new).half()
 
-            # 5. Expression delta (Capa 1: Lipsync reactivo desacoplado para labios + estabilidad facial)
-            delta_raw = x_d_i_info["exp"] - self.x_d_0_info["exp"]
+        # 5. Expression delta (Capa 1: Lipsync reactivo desacoplado para labios + estabilidad facial)
+        delta_raw = x_d_i_info["exp"] - self.x_d_0_info["exp"]
 
-            # Región facial (cejas, pómulos): deadband suave anti-jitter y filtro One-Euro suave
-            delta_face = delta_raw.clone()
-            deadband_face = 0.0045
-            delta_face = torch.where(torch.abs(delta_face) < deadband_face, delta_face * 0.25, delta_face)
-            delta_face_smooth = self.smoother_exp_face.update(delta_face)
+        # Región facial (cejas, pómulos): deadband suave anti-jitter y filtro One-Euro suave
+        delta_face_smooth = self.smoother_exp_face.update(soft_deadband(delta_raw, 0.0045, 0.25), dt)
 
-            # Región labial (articulación vocal / fonemas): deadband anti-muecas en reposo + One-Euro adaptativo
-            delta_lip_raw = delta_raw.clone()
-            deadband_lip = 0.0055
-            delta_lip_raw = torch.where(torch.abs(delta_lip_raw) < deadband_lip, delta_lip_raw * 0.20, delta_lip_raw)
-            delta_lip_smooth = self.smoother_exp_lip.update(delta_lip_raw)
+        # Región labial (articulación vocal / fonemas): deadband anti-muecas en reposo + One-Euro adaptativo
+        delta_lip_smooth = self.smoother_exp_lip.update(soft_deadband(delta_raw, 0.0055, 0.20), dt)
 
-            # Fusión de componentes:
-            # - Resto del rostro escala con driving_multiplier (control natural de expresiones secundarias)
-            # - Labios escalan con lip_multiplier (articulación nítida e independiente de la cabeza)
-            delta_combined = delta_face_smooth.clone()
-            for idx in self.FACE_INDICES:
-                delta_combined[:, idx, :] = delta_face_smooth[:, idx, :] * self.driving_multiplier
-            for idx in self.LIP_INDICES:
-                delta_combined[:, idx, :] = delta_lip_smooth[:, idx, :] * self.lip_multiplier
+        # Fusión de componentes:
+        # - Resto del rostro escala con driving_multiplier (control natural de expresiones secundarias)
+        # - Labios escalan con lip_multiplier (articulación nítida e independiente de la cabeza)
+        delta_combined = torch.where(self.lip_mask,
+                                     delta_lip_smooth * self.lip_multiplier,
+                                     delta_face_smooth * self.driving_multiplier)
 
-            delta_new = self.x_s_info["exp"] + delta_combined
+        delta_new = self.x_s_info["exp"] + delta_combined
 
-            # 6. Translation and scale (smoothed and controlled)
-            t_raw = x_d_i_info["t"] - self.x_d_0_info["t"]
-            t_smooth = self.smoother_t.update(t_raw)
-            t_new = self.x_s_info["t"] + t_smooth * self.driving_multiplier
-            t_new[..., 2].fill_(0)
+        # 6. Translation and scale (smoothed and controlled)
+        t_raw = x_d_i_info["t"] - self.x_d_0_info["t"]
+        t_smooth = self.smoother_t.update(t_raw, dt)
+        t_new = self.x_s_info["t"] + t_smooth * self.driving_multiplier
+        t_new[..., 2].fill_(0)
 
-            scale_raw = (x_d_i_info["scale"] / self.x_d_0_info["scale"] - 1.0) * self.driving_multiplier + 1.0
-            scale_smooth = self.smoother_scale.update(scale_raw)
-            scale_new = self.x_s_info["scale"] * scale_smooth
+        scale_raw = (x_d_i_info["scale"] / self.x_d_0_info["scale"] - 1.0) * self.driving_multiplier + 1.0
+        scale_smooth = self.smoother_scale.update(scale_raw, dt)
+        scale_new = self.x_s_info["scale"] * scale_smooth
 
-            x_d_i_new = (scale_new * (self.x_c_s @ R_new + delta_new) + t_new).half()
+        x_d_i_new = (scale_new * (self.x_c_s @ R_new + delta_new) + t_new).half()
 
-            # 7. Eye Retargeting: Natural blink closure ONLY, strictly preventing bulging/crazy eyes
-            r_eyes_cur = calc_eye_close_ratio(lmk[None])
-            cur_eye_val = float(r_eyes_cur.mean())
-            if self.c_d_eye_0 is None:
-                self.c_d_eye_0 = max(cur_eye_val, 0.15)
-            elif cur_eye_val > self.c_d_eye_0:
-                # Slowly adapt baseline upward if user opens eyes wider
-                self.c_d_eye_0 = 0.98 * self.c_d_eye_0 + 0.02 * cur_eye_val
+        # 7. Eye Retargeting: Natural blink closure ONLY, strictly preventing bulging/crazy eyes
+        r_eyes_cur = calc_eye_close_ratio(lmk[None])
+        cur_eye_val = float(r_eyes_cur.mean())
+        if self.c_d_eye_0 is None:
+            self.c_d_eye_0 = max(cur_eye_val, 0.15)
+        elif cur_eye_val > self.c_d_eye_0:
+            # Slowly adapt baseline upward if user opens eyes wider
+            self.c_d_eye_0 = 0.98 * self.c_d_eye_0 + 0.02 * cur_eye_val
 
-            rel_eye = cur_eye_val / self.c_d_eye_0
-            if rel_eye < 0.82:
-                # User is closing eyes / blinking
-                blink_prog = float(np.clip((0.82 - rel_eye) / (0.82 - 0.45), 0.0, 1.0))
-                blink_w = blink_prog * blink_prog * (3.0 - 2.0 * blink_prog)
-                target_val = (1.0 - blink_w) * self.c_s_eye_mean + blink_w * 0.03
-                target_tensor = torch.tensor([[target_val]]).half().to(f"cuda:{self.device_id}")
-                target_filtered = self.smoother_eye.update(target_tensor)
-                combined_eye = torch.cat([self.c_s_eyes_tensor, target_filtered], dim=1)
-                delta_eye = self.wrapper.retarget_eye(self.x_s.half(), combined_eye)
-                x_d_i_new = x_d_i_new + delta_eye * (blink_w * 0.85)
-            else:
-                # Fully open: delta_eye is zero. Eyes remain 100% natural, never bulging!
-                self.smoother_eye.reset()
+        rel_eye = cur_eye_val / self.c_d_eye_0
+        if rel_eye < 0.82:
+            # User is closing eyes / blinking
+            blink_w = smoothstep((0.82 - rel_eye) / (0.82 - 0.45))
+            target_val = (1.0 - blink_w) * self.c_s_eye_mean + blink_w * 0.03
+            target_filtered = float(self.smoother_eye.update(np.array([target_val]), dt)[0])
+            self.eye_ratio_buf[:, -1].fill_(target_filtered)
+            delta_eye = self.wrapper.retarget_eye(self.x_s, self.eye_ratio_buf)
+            x_d_i_new = x_d_i_new + delta_eye * (blink_w * 0.85)
+        else:
+            # Fully open: delta_eye is zero. Eyes remain 100% natural, never bulging!
+            self.smoother_eye.reset()
 
-            # Capa 2: Lip Retargeting Asistido (Asistencia inteligente de sellado sin sobre-apertura)
-            # Solo interviene para cerrar suavemente si la boca está en reposo; al hablar no suma apertura extra
-            if self.inf_cfg.flag_lip_retargeting and self.c_d_lip_0 is not None:
-                r_lip_raw = float(calc_lip_close_ratio(lmk[None])[0, 0])
-                r_lip_cur = float(self.smoother_lip_seal.update(np.array([r_lip_raw]))[0])
-                if r_lip_cur < self.c_d_lip_0 * 1.15:
-                    c_d_lip_tensor = torch.tensor([[r_lip_cur]], dtype=torch.float16, device=f"cuda:{self.device_id}")
-                    combined_lip = torch.cat([self.c_s_lip_tensor, c_d_lip_tensor], dim=1)
-                    delta_lip = self.wrapper.retarget_lip(self.x_s.half(), combined_lip)
-                    seal_factor = max(0.0, 1.0 - (r_lip_cur / (self.c_d_lip_0 * 1.15)))
-                    x_d_i_new = x_d_i_new + delta_lip * (0.08 * seal_factor)
+        # Capa 2: Lip Retargeting Asistido (Asistencia inteligente de sellado sin sobre-apertura)
+        # Solo interviene para cerrar suavemente si la boca está en reposo; al hablar no suma apertura extra
+        if self.inf_cfg.flag_lip_retargeting and self.c_d_lip_0 is not None:
+            r_lip_raw = float(calc_lip_close_ratio(lmk[None])[0, 0])
+            r_lip_cur = float(self.smoother_lip_seal.update(np.array([r_lip_raw]), dt)[0])
+            if r_lip_cur < self.c_d_lip_0 * 1.15:
+                self.lip_ratio_buf[:, -1].fill_(r_lip_cur)
+                delta_lip = self.wrapper.retarget_lip(self.x_s, self.lip_ratio_buf)
+                seal_factor = max(0.0, 1.0 - (r_lip_cur / (self.c_d_lip_0 * 1.15)))
+                x_d_i_new = x_d_i_new + delta_lip * (0.08 * seal_factor)
 
-            # 8. Stitching
-            if self.inf_cfg.flag_stitching:
-                x_d_i_new = self.wrapper.stitching(self.x_s, x_d_i_new).half()
+        # 8. Stitching
+        if self.inf_cfg.flag_stitching:
+            x_d_i_new = self.wrapper.stitching(self.x_s, x_d_i_new).half()
+        return x_d_i_new
 
-            # 9. Warping and SPADE Generator Decoding
-            out = self.wrapper.warp_decode(self.f_s, self.x_s, x_d_i_new)
-            out_crop = self.wrapper.parse_output(out["out"])[0]  # HxWx3 uint8 RGB
+    def _postprocess(self, out: torch.Tensor) -> np.ndarray:
+        """1x3xHxW float [0,1] en GPU -> HxWx3 uint8 RGB en CPU, con grano de piel aplicado en GPU."""
+        out = out * 255.0
+        if self.skin_noise > 0.0:
+            _, c, h, w = out.shape
+            if self.noise_tex is None or self.noise_tex.shape[-2:] != (h + self.NOISE_PAD, w + self.NOISE_PAD):
+                self.noise_tex = torch.randn((1, c, h + self.NOISE_PAD, w + self.NOISE_PAD),
+                                             device=out.device, dtype=out.dtype) * self.skin_noise
+            oy, ox = np.random.randint(0, self.NOISE_PAD + 1, size=2)
+            out = out + self.noise_tex[:, :, oy:oy + h, ox:ox + w]
+        out = out.clamp_(0.0, 255.0).to(torch.uint8)
+        return out[0].permute(1, 2, 0).contiguous().cpu().numpy()
 
-            # Skin texture grain to reduce plastic / over-smoothed appearance
-            if self.skin_noise > 0.0:
-                noise = np.random.normal(0, self.skin_noise, out_crop.shape).astype(np.int16)
-                out_crop = np.clip(out_crop.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-
-        self.is_tracking = True
+    def _render(self, kp: torch.Tensor) -> np.ndarray:
+        """Warping + SPADE decoding de unos keypoints de conducción y composición final (BGR)."""
+        self.last_kp_out = kp
+        out = self.wrapper.warp_decode(self.f_s, self.x_s, kp)
+        out_crop = self._postprocess(out["out"])  # HxWx3 uint8 RGB
 
         # 10. Formatting and Pasteback (with seamlessClone & fallback)
         if self.flag_pasteback and self.mask_ori_float is not None:
@@ -418,7 +508,6 @@ class LivePortraitCamPipeline:
             return cv2.cvtColor(out_full, cv2.COLOR_RGB2BGR)
         else:
             return cv2.cvtColor(out_crop, cv2.COLOR_RGB2BGR)
-
 
 def format_frame_for_output(frame: np.ndarray, target_w: int = 640, target_h: int = 480, is_pasteback: bool = False) -> np.ndarray:
     """
