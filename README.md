@@ -29,8 +29,8 @@ Acelerado mediante GPU NVIDIA (CUDA / Tensor Cores) y estabilizado mediante **Fi
 
 ### 1. Clonar el Repositorio
 ```bash
-git clone https://github.com/TU_USUARIO/TU_REPOSITORIO.git
-cd TU_REPOSITORIO
+git clone https://github.com/ProgramaGrueso/alterego-tts.git
+cd alterego-tts
 ```
 
 ### 2. Configurar el Entorno Virtual
@@ -96,7 +96,7 @@ Puedes iniciar la aplicación directamente desde cualquier terminal ejecutando:
 avatar
 ```
 
-*(Consulta [`AVATAR_CLI.md`](file:///mnt/Datos/Proyecto/avatar/AVATAR_CLI.md) para detalles completos de arquitectura y opciones).*
+*(Consulta [`AVATAR_CLI.md`](AVATAR_CLI.md) para detalles completos de arquitectura y opciones).*
 
 O invocando directamente el script con Python:
 

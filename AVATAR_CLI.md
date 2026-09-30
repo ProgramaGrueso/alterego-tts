@@ -19,13 +19,13 @@ Se configuró un comando ejecutable global en el sistema (`avatar`) que:
 
 ### A. Lanzador en el PATH del Usuario (`~/.local/bin/avatar`)
 
-Se creó un script ejecutable Bash en [`/home/juang/.local/bin/avatar`](file:///home/juang/.local/bin/avatar):
+Se creó un script ejecutable Bash en `~/.local/bin/avatar`:
 
 ```bash
 #!/usr/bin/env bash
 set -e
 
-PROJECT_DIR="/mnt/Datos/Proyecto/avatar"
+PROJECT_DIR="$HOME/alterego-tts"  # ajusta a la ruta de tu clon
 VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
 MAIN_SCRIPT="$PROJECT_DIR/run_live_cam.py"
 
@@ -59,10 +59,10 @@ exec "$VENV_PYTHON" "$MAIN_SCRIPT" "$@"
 
 Se le otorgaron permisos de ejecución mediante:
 ```bash
-chmod +x /home/juang/.local/bin/avatar
+chmod +x ~/.local/bin/avatar
 ```
 
-### B. Ajustes en [`run_live_cam.py`](file:///mnt/Datos/Proyecto/avatar/run_live_cam.py)
+### B. Ajustes en [`run_live_cam.py`](run_live_cam.py)
 
 1. **Resolución de ruta del avatar canónico**:
    Se implementó la función `find_default_source_image()` para localizar de manera absoluta los archivos de imagen dentro del proyecto (`avatar.png`, `avatar2.png` o `sample_avatar.jpg`), evitando errores de archivo no encontrado al ejecutar desde directorios ajenos (como `~` o `/tmp`).
