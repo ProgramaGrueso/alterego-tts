@@ -125,7 +125,7 @@ class MediaPipeFaceDetector:
 
 
 class LivePortraitCamPipeline:
-    def __init__(self, source_image_path: str, device_id: int = 0, flag_pasteback: bool = False, flag_compile: bool = False, driving_multiplier: float = 0.50, skin_noise: float = 2.5, flag_fp32_generator: bool = False, flag_lip_retargeting: bool = True, lip_multiplier: float = 1.00, flag_seamless: bool = False, output_size=(640, 480), backend: str = "torch", detector: str = "insightface", trt_engine_dir: str = None):
+    def __init__(self, source_image_path: str, device_id: int = 0, flag_pasteback: bool = False, flag_compile: bool = False, driving_multiplier: float = 0.50, skin_noise: float = 2.5, flag_fp32_generator: bool = False, flag_lip_retargeting: bool = True, lip_multiplier: float = 1.00, flag_seamless: bool = False, output_size=(640, 480), backend: str = "torch", detector: str = "insightface", trt_engine_dir: str = None, gaze_multiplier: float = 0.0, flag_wink: bool = False):
         self.device_id = device_id
         self.flag_pasteback = flag_pasteback
         self.flag_seamless = flag_seamless
@@ -134,6 +134,8 @@ class LivePortraitCamPipeline:
         self.skin_noise = float(skin_noise)
         self.flag_fp32_generator = flag_fp32_generator
         self.flag_lip_retargeting = flag_lip_retargeting
+        self.gaze_multiplier = float(gaze_multiplier)
+        self.flag_wink = flag_wink
         self.lip_multiplier = float(lip_multiplier)
 
         # Facial keypoint indices in LivePortrait latent expression space
@@ -156,6 +158,7 @@ class LivePortraitCamPipeline:
         self.smoother_scale = OneEuroFilter(min_cutoff=0.45, beta=0.02)
         self.smoother_eye = OneEuroFilter(min_cutoff=2.5, beta=0.10)
         self.smoother_lip_seal = OneEuroFilter(min_cutoff=1.0, beta=0.05)
+        self.smoother_gaze = OneEuroFilter(min_cutoff=1.5, beta=0.5)
 
         # Check CUDA availability
         if not torch.cuda.is_available():
@@ -252,6 +255,16 @@ class LivePortraitCamPipeline:
         self.lip_mask = torch.zeros((1, num_kp, 1), dtype=torch.bool, device=self.device)
         self.lip_mask[:, self.LIP_INDICES] = True
 
+        # --wink: el retargeting de ojos mueve los dos ojos a la vez; su delta se separa por
+        # lado según la x del keypoint fuente (x<0 = ojo izquierdo de la imagen = landmarks 0:24).
+        self.eye_side_masks = ((self.x_s[..., 0:1] < 0).half(), (self.x_s[..., 0:1] >= 0).half())
+        self.c_d_eyes_0 = None
+        self.smoother_eyes = OneEuroFilter(min_cutoff=2.5, beta=0.10)
+
+        # --gaze-multiplier: delta de mirada sobre los keypoints de los globos oculares
+        self.gaze_delta = torch.zeros_like(self.x_s_info["exp"]).half()
+        self.gaze_0 = None
+
         # Textura de grano de piel generada una sola vez (se crea al conocer la resolución
         # de salida); cada frame toma un recorte con offset aleatorio para que no quede fija.
         self.NOISE_PAD = 64
@@ -340,7 +353,7 @@ class LivePortraitCamPipeline:
     def _reset_smoothers(self):
         for f in (self.smoother_lmk, self.smoother_angles, self.smoother_exp_face,
                   self.smoother_exp_lip, self.smoother_t, self.smoother_scale,
-                  self.smoother_eye, self.smoother_lip_seal):
+                  self.smoother_eye, self.smoother_lip_seal, self.smoother_gaze):
             f.reset()
 
     def calibrate_neutral_pose(self, x_d_info, lmk):
@@ -350,6 +363,8 @@ class LivePortraitCamPipeline:
         self.c_d_eye_0 = max(float(r_eyes.mean()), 0.15)
         r_lip = calc_lip_close_ratio(lmk[None])
         self.c_d_lip_0 = max(float(r_lip[0, 0]), 0.02)
+        self.c_d_eyes_0 = np.maximum(r_eyes[0], 0.15)
+        self.gaze_0 = calc_gaze_offset(lmk)
         self._reset_smoothers()
         print(f"[+] Pose neutra calibrada (Sensibilidad cabeza: {self.driving_multiplier:.2f} | Labios: {self.lip_multiplier:.2f} | Ojos: {self.c_d_eye_0:.2f} | Boca reposo: {self.c_d_lip_0:.2f}).")
 
@@ -503,6 +518,8 @@ class LivePortraitCamPipeline:
                                      delta_face_smooth * self.driving_multiplier)
 
         delta_new = self.x_s_info["exp"] + delta_combined
+        if self.gaze_multiplier > 0.0:
+            delta_new = delta_new + self._gaze_delta(lmk, dt)
 
         # 6. Translation and scale (smoothed and controlled)
         t_raw = x_d_i_info["t"] - self.x_d_0_info["t"]
@@ -517,6 +534,15 @@ class LivePortraitCamPipeline:
         x_d_i_new = (scale_new * (self.x_c_s @ R_new + delta_new) + t_new).half()
 
         # 7. Eye Retargeting: Natural blink closure ONLY, strictly preventing bulging/crazy eyes
+        if self.flag_wink:
+            x_d_i_new = x_d_i_new + self._wink_delta(lmk, dt)
+        else:
+            x_d_i_new = self._blink_both(x_d_i_new, lmk, dt)
+
+        return self._finish_keypoints(x_d_i_new, lmk, dt)
+
+    def _blink_both(self, x_d_i_new, lmk, dt):
+        """Parpadeo simétrico: ambos ojos se cierran según la media de los dos."""
         r_eyes_cur = calc_eye_close_ratio(lmk[None])
         cur_eye_val = float(r_eyes_cur.mean())
         if self.c_d_eye_0 is None:
@@ -537,7 +563,56 @@ class LivePortraitCamPipeline:
         else:
             # Fully open: delta_eye is zero. Eyes remain 100% natural, never bulging!
             self.smoother_eye.reset()
+        return x_d_i_new
 
+    def _wink_delta(self, lmk, dt):
+        """
+        --wink: cada ojo con su propio ratio y su propia referencia, así un guiño cierra
+        solo ese ojo. La red de retargeting solo acepta un valor de cierre, así que se evalúa
+        una vez por ojo y de cada salida se conserva solo el lado correspondiente.
+        """
+        r_eyes = calc_eye_close_ratio(lmk[None])[0]
+        # Referencia por ojo: sube lentamente si se abren más (igual que el modo simétrico)
+        self.c_d_eyes_0 = np.where(r_eyes > self.c_d_eyes_0,
+                                   0.98 * self.c_d_eyes_0 + 0.02 * r_eyes, self.c_d_eyes_0)
+        rel = r_eyes / self.c_d_eyes_0
+        blink_w = np.array([smoothstep((0.82 - v) / (0.82 - 0.45)) if v < 0.82 else 0.0 for v in rel])
+        if not blink_w.any():
+            self.smoother_eyes.reset()
+            return 0.0
+        targets = self.smoother_eyes.update((1.0 - blink_w) * self.c_s_eye_mean + blink_w * 0.03, dt)
+        delta = 0.0
+        for side in range(2):
+            if blink_w[side] > 0.0:
+                self.eye_ratio_buf[:, -1].fill_(float(targets[side]))
+                d = self.wrapper.retarget_eye(self.x_s, self.eye_ratio_buf)
+                delta = delta + d * self.eye_side_masks[side] * float(blink_w[side] * 0.85)
+        return delta
+
+    # Ganancia pupila->edición de mirada, medida renderizando el avatar con la edición de
+    # globo ocular de LivePortrait: 15 unidades desplazan la pupila ~0.16 anchos de ojo en x,
+    # así que tu desplazamiento relativo se copia ~1:1. En y el landmark de la pupila apenas
+    # se mueve (se mueve el párpado), así que se usa la misma ganancia para no amplificar ruido.
+    GAZE_GAIN_X = GAZE_GAIN_Y = 15.0 / 0.16
+    GAZE_LIMIT = 25.0
+
+    def _gaze_delta(self, lmk, dt):
+        """--gaze-multiplier: posición de la pupila (landmarks 197/198) -> keypoints 11/15."""
+        g = self.smoother_gaze.update(calc_gaze_offset(lmk) - self.gaze_0, dt)
+        gx = float(np.clip(g[0] * self.GAZE_GAIN_X * self.gaze_multiplier, -self.GAZE_LIMIT, self.GAZE_LIMIT))
+        # En vertical el párpado arrastra el landmark de la pupila: se atenúa al parpadear
+        r_eyes = calc_eye_close_ratio(lmk[None])[0] / np.maximum(self.c_d_eyes_0, 1e-3)
+        open_w = float(np.clip((r_eyes.min() - 0.6) / 0.3, 0.0, 1.0))
+        gy = float(np.clip(-g[1] * self.GAZE_GAIN_Y * self.gaze_multiplier * open_w, -self.GAZE_LIMIT, self.GAZE_LIMIT))
+        # Fórmula de edición de globo ocular de LivePortrait (gradio_pipeline), en espacio exp
+        k11, k15 = (0.0007, 0.001) if gx > 0 else (0.001, 0.0007)
+        self.gaze_delta[0, 11, 0] = gx * k11
+        self.gaze_delta[0, 15, 0] = gx * k15
+        self.gaze_delta[0, 11, 1] = gy * -0.001
+        self.gaze_delta[0, 15, 1] = gy * -0.001
+        return self.gaze_delta
+
+    def _finish_keypoints(self, x_d_i_new, lmk, dt):
         # Capa 2: Lip Retargeting Asistido (Asistencia inteligente de sellado sin sobre-apertura)
         # Solo interviene para cerrar suavemente si la boca está en reposo; al hablar no suma apertura extra
         if self.inf_cfg.flag_lip_retargeting and self.c_d_lip_0 is not None:
@@ -605,6 +680,18 @@ class LivePortraitCamPipeline:
             out_full = paste_back(out_crop, self.M_c2o, self.source_rgb, self.mask_ori_float)
         return cv2.cvtColor(out_full, cv2.COLOR_RGB2BGR)
 
+def calc_gaze_offset(lmk: np.ndarray) -> np.ndarray:
+    """
+    Posición media de las pupilas (landmarks 197/198) respecto al centro de cada ojo
+    (contornos 0:24 y 24:48), en anchos de ojo. Devuelve [dx, dy].
+    """
+    offs = []
+    for contour, pupil in ((lmk[0:24], lmk[197]), (lmk[24:48], lmk[198])):
+        width = max(float(np.ptp(contour[:, 0])), 1.0)
+        offs.append((pupil - contour.mean(axis=0)) / width)
+    return np.mean(offs, axis=0)
+
+
 def format_frame_for_output(frame: np.ndarray, target_w: int = 640, target_h: int = 480, is_pasteback: bool = False) -> np.ndarray:
     """
     Ensures natural aspect ratio when streaming to virtual camera.
@@ -614,23 +701,17 @@ def format_frame_for_output(frame: np.ndarray, target_w: int = 640, target_h: in
     target_ratio = target_w / target_h
     current_ratio = w / h
 
-    if is_pasteback:
-        if abs(current_ratio - target_ratio) < 0.05:
-            return cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        elif current_ratio < target_ratio:
-            # Source is narrower/taller than target (e.g. 1:1 image to 4:3 screen)
-            crop_h = int(w / target_ratio)
-            y_offset = max(0, int((h - crop_h) * 0.35))  # Keep head and upper torso
-            cropped = frame[y_offset:y_offset + crop_h, :]
-            return cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
-        else:
-            # Source is wider than target
-            crop_w = int(h * target_ratio)
-            x_offset = (w - crop_w) // 2
-            cropped = frame[:, x_offset:x_offset + crop_w]
-            return cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    if is_pasteback and abs(current_ratio - target_ratio) < 0.05:
+        return cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    elif is_pasteback and current_ratio > target_ratio:
+        # Source is wider than target: crop the sides
+        crop_w = int(h * target_ratio)
+        x_offset = (w - crop_w) // 2
+        cropped = frame[:, x_offset:x_offset + crop_w]
+        return cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_AREA)
     else:
-        # Square cropped face mode: maintain 1:1 face proportion with blurred background canvas
+        # Face crop, or a portrait taller than 4:3 (e.g. 9:16): show the whole frame
+        # centered over a blurred background instead of cropping it down to the face
         scale = min(target_w / w, target_h / h)
         rw, rh = int(w * scale), int(h * scale)
         resized = cv2.resize(frame, (rw, rh), interpolation=cv2.INTER_AREA)
@@ -696,8 +777,8 @@ def parse_args():
                         help=f"Virtual camera device node (default: {find_default_virtual_cam()}).")
     parser.add_argument("--fps", type=int, default=30,
                         help="Target streaming frame rate (default: 30).")
-    parser.add_argument("--pasteback", action="store_true",
-                        help="Paste animated face back into full portrait frame.")
+    parser.add_argument("--pasteback", action=argparse.BooleanOptionalAction, default=True,
+                        help="Paste animated face back into full portrait frame (default: True, use --no-pasteback for the face crop only).")
     parser.add_argument("--seamless", action="store_true",
                         help="With --pasteback: use cv2.seamlessClone at full avatar resolution instead of the GPU feathered alpha blend (much slower).")
     parser.add_argument("--compile", action="store_true",
@@ -708,6 +789,10 @@ def parse_args():
                         help="Lip speech articulation multiplier (default: 1.00). Adjusts amplitude of mouth visemes/phonemes without head motion interference.")
     parser.add_argument("--lip-retargeting", action=argparse.BooleanOptionalAction, default=True,
                         help="Enable secondary landmark lip-seal assistance (default: True, use --no-lip-retargeting to disable).")
+    parser.add_argument("--gaze-multiplier", type=float, default=0.0,
+                        help="(Experimental) Make the avatar follow your gaze from your pupil landmarks. 1.0 copies your eye movement 1:1 (default: 0 = off).")
+    parser.add_argument("--wink", action=argparse.BooleanOptionalAction, default=False,
+                        help="(Experimental) Close each eye independently so winks are copied (default: off, both eyes blink together).")
     parser.add_argument("--no-preview", action="store_true",
                         help="Disable interactive OpenCV preview window (preview is enabled by default).")
     parser.add_argument("--skin-noise", type=float, default=2.5,
@@ -718,8 +803,9 @@ def parse_args():
                         help="Run in benchmark mode for N seconds and exit with FPS statistics.")
     parser.add_argument("--no-virtualcam", action="store_true",
                         help="Disable virtual camera output (useful for testing without v4l2loopback).")
-    parser.add_argument("--backend", choices=["torch", "trt"], default="torch",
-                        help="Inference backend: torch (default) or trt (TensorRT engines, see README).")
+    default_backend = "trt" if os.path.exists(os.path.join(DEFAULT_TRT_DIR, "warping_spade-fix.trt")) else "torch"
+    parser.add_argument("--backend", choices=["torch", "trt"], default=default_backend,
+                        help=f"Inference backend: torch or trt (TensorRT engines, see README). Default: trt if the engines are built, else torch (now: {default_backend}).")
     parser.add_argument("--trt-engine-dir", type=str, default=DEFAULT_TRT_DIR,
                         help=f"Directory with the TensorRT engines + GridSample3D plugin (default: {DEFAULT_TRT_DIR}).")
     parser.add_argument("--detector", choices=["insightface", "mediapipe"], default="insightface",
@@ -934,6 +1020,8 @@ def main():
     print(f" Skin Grain Noise: {args.skin_noise}")
     print(f" FP32 Generator:   {args.fp32_generator}")
     print(f" Backend:          {args.backend}")
+    print(f" Gaze follow:      {args.gaze_multiplier:.2f}{' (off)' if args.gaze_multiplier <= 0 else ''}")
+    print(f" Wink (per eye):   {args.wink}")
     print(f" Face Detector:    {args.detector}")
     print("=" * 65)
 
@@ -966,6 +1054,8 @@ def main():
         flag_fp32_generator=args.fp32_generator,
         flag_lip_retargeting=args.lip_retargeting,
         lip_multiplier=args.lip_multiplier,
+        gaze_multiplier=args.gaze_multiplier,
+        flag_wink=args.wink,
         flag_seamless=args.seamless,
         output_size=(out_w, out_h),
         backend=args.backend,

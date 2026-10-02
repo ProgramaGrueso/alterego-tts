@@ -39,5 +39,19 @@ bench/results/*.log
 /*.jpg
 /*.jpeg
 backup_photos/
+backup_nohbg/
 imgs/
 avatars/
+backup_portrait/
+
+# Ninguna foto fuera del código de LivePortrait (sus assets de ejemplo sí se versionan)
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.heic
+*.bmp
+*.tif
+*.tiff
+!liveportrait_src/**/*.png
+!liveportrait_src/**/*.jpg

@@ -125,12 +125,14 @@ python run_live_cam.py \
 | `--fps` | Tasa de fotogramas objetivo | `30` |
 | `--driving-multiplier`, `-m` | Intensidad de movimiento de cabeza y rostro (0.40 - 0.60 es óptimo) | `0.50` |
 | `--lip-multiplier` | Articulación de labios (fonemas/habla) | `1.00` |
-| `--pasteback` | Re-inserta el rostro en el retrato completo con fondo (alpha blend con feather en GPU) | Desactivado |
+| `--gaze-multiplier` | (Experimental) El avatar sigue tu mirada a partir de tus pupilas; `1.0` ≈ 1:1 | `0` (apagado) |
+| `--wink` / `--no-wink` | (Experimental) Cada ojo se cierra por separado, así se copian los guiños | Apagado |
+| `--pasteback` / `--no-pasteback` | Re-inserta el rostro en el retrato completo con fondo (alpha blend con feather en GPU) | Activado |
 | `--seamless` | Con `--pasteback`: usa `cv2.seamlessClone` a resolución completa (lento, ~0.7 FPS con avatares 2048 px) | Desactivado |
 | `--no-preview` | Desactiva la ventana local de OpenCV (el preview está activo por defecto) | Preview activo |
 | `--compile` | Activa `torch.compile` (requiere Triton instalado en el venv) | Desactivado |
 | `--no-virtualcam` | Ejecuta solo en ventana sin requerir el módulo v4l2 | Desactivado |
-| `--backend` | Backend de inferencia: `torch` o `trt` (motores TensorRT, ver abajo) | `torch` |
+| `--backend` | Backend de inferencia: `torch` o `trt` (motores TensorRT, ver abajo) | `trt` si los motores existen, si no `torch` |
 | `--trt-engine-dir` | Carpeta con los motores `.trt` y el plugin GridSample3D | `liveportrait_src/pretrained_weights/faster_liveportrait/trt_engines` |
 | `--detector` | Detector para (re)adquirir el rostro: `insightface` o `mediapipe` | `insightface` |
 | `--driving-video` | Usa un vídeo en bucle (a su FPS nativo) en lugar de la webcam; benchmarks reproducibles | — |
