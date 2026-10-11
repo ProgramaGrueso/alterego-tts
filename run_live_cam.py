@@ -759,7 +759,7 @@ def find_default_virtual_cam():
 
 
 def find_default_source_image():
-    for candidate in ["avatar.png", "avatar2.png", "avatar.jpg"]:
+    for candidate in ["avatar.png", "avatar2.png", "avatar.jpg", "sample_avatar.png", "sample_avatar.jpg"]:
         candidate_path = os.path.join(CURRENT_DIR, candidate)
         if os.path.exists(candidate_path):
             return candidate_path
