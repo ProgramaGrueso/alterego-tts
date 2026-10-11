@@ -55,3 +55,12 @@ backup_portrait/
 *.tiff
 !liveportrait_src/**/*.png
 !liveportrait_src/**/*.jpg
+
+# Secretos: nunca al repositorio
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*.json
+secrets*
